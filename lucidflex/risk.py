@@ -2,6 +2,7 @@
 
 Implements the three-layer MLL protection system and adaptive consistency
 targeting that achieved 0 MLL breaches across 20,000 backtest runs.
+Now with session-aware position sizing.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ class EvalState:
 
 
 class RiskManager:
-    """Three-layer MLL protection + position sizing + daily limits."""
+    """Three-layer MLL protection + session-weighted position sizing + daily limits."""
 
     def __init__(self, state: EvalState) -> None:
         self.state = state
@@ -99,12 +100,18 @@ class RiskManager:
             return C.MLL_REDUCE_1200_CAP
         return C.MAX_MGC_CONTRACTS
 
-    # ── Position sizing ─────────────────────────────────────────────────
+    # ── Position sizing (session-weighted) ──────────────────────────────
 
-    def size_position(self, sl_ticks: int, is_news: bool = False) -> int:
+    def size_position(
+        self,
+        sl_ticks: int,
+        is_news: bool = False,
+        session_weight: float = 1.0,
+    ) -> int:
         sl_ticks = max(C.SL_TICK_MIN, min(C.SL_TICK_MAX, sl_ticks))
 
-        risk_dollars = self.state.equity * C.RISK_PCT
+        # Scale risk by session quality (NY Open=1.0, Lunch=0.5, etc.)
+        risk_dollars = self.state.equity * C.RISK_PCT * session_weight
         raw_qty = int(risk_dollars / (sl_ticks * C.MGC_TICK_VALUE))
 
         cap = self.max_contracts()

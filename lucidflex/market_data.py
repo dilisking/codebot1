@@ -2,7 +2,7 @@
 
 Handles Rithmic market data subscriptions, maintains rolling bar history,
 and computes all indicators needed by the five trade setups:
-  VWAP, EMA9/21, RSI14, volume average, session high/low, ORB range.
+  VWAP, EMA9/21 (5m + 1H), RSI14, volume average, session high/low, ORB range.
 """
 
 from __future__ import annotations
@@ -40,7 +40,8 @@ class Indicators:
     __slots__ = (
         "_bars_5m", "_bars_1h", "_vwap_cum_pv", "_vwap_cum_vol",
         "_vwap", "_ema_fast", "_ema_slow", "_rsi", "_rsi_gains",
-        "_rsi_losses", "_vol_avg",
+        "_rsi_losses", "_vol_sum", "_vol_count",
+        "_ema_1h_fast", "_ema_1h_slow",
     )
 
     def __init__(self) -> None:
@@ -54,7 +55,12 @@ class Indicators:
         self._rsi: float = 50.0
         self._rsi_gains: float = 0.0
         self._rsi_losses: float = 0.0
-        self._vol_avg: float = 0.0
+        # Rolling volume average (O(1) updates)
+        self._vol_sum: int = 0
+        self._vol_count: int = 0
+        # 1H EMA for multi-timeframe trend filter
+        self._ema_1h_fast: float = 0.0
+        self._ema_1h_slow: float = 0.0
 
     # ── Public accessors ────────────────────────────────────────────────
 
@@ -76,7 +82,7 @@ class Indicators:
 
     @property
     def volume_avg(self) -> float:
-        return self._vol_avg
+        return self._vol_sum / self._vol_count if self._vol_count > 0 else 0.0
 
     @property
     def bars_5m(self) -> Deque[Bar]:
@@ -92,6 +98,14 @@ class Indicators:
             return self._bars_5m[-1].close
         return 0.0
 
+    @property
+    def ema_1h_fast(self) -> float:
+        return self._ema_1h_fast
+
+    @property
+    def ema_1h_slow(self) -> float:
+        return self._ema_1h_slow
+
     # ── VWAP reset (daily at 6 PM EST / CME open) ──────────────────────
 
     def reset_vwap(self) -> None:
@@ -103,14 +117,23 @@ class Indicators:
     # ── Feed new bars ───────────────────────────────────────────────────
 
     def update_5m(self, bar: Bar) -> None:
+        # Rolling volume: subtract the bar that falls out of the window
+        if len(self._bars_5m) >= C.VOLUME_AVG_PERIOD:
+            evicted = self._bars_5m[-C.VOLUME_AVG_PERIOD]
+            self._vol_sum -= evicted.volume
+        else:
+            self._vol_count = min(self._vol_count + 1, C.VOLUME_AVG_PERIOD)
+
         self._bars_5m.append(bar)
+        self._vol_sum += bar.volume
+
         self._update_vwap(bar)
         self._update_ema(bar.close)
         self._update_rsi(bar.close)
-        self._update_volume_avg()
 
     def update_1h(self, bar: Bar) -> None:
         self._bars_1h.append(bar)
+        self._update_1h_ema(bar.close)
 
     # ── VWAP (cumulative, resets at CME open) ───────────────────────────
 
@@ -121,7 +144,7 @@ class Indicators:
         if self._vwap_cum_vol > 0:
             self._vwap = self._vwap_cum_pv / self._vwap_cum_vol
 
-    # ── EMA 9 / 21 ─────────────────────────────────────────────────────
+    # ── EMA 9 / 21 (5-minute) ──────────────────────────────────────────
 
     def _update_ema(self, price: float) -> None:
         n = len(self._bars_5m)
@@ -133,6 +156,19 @@ class Indicators:
         k_slow = 2.0 / (C.EMA_SLOW + 1)
         self._ema_fast = price * k_fast + self._ema_fast * (1 - k_fast)
         self._ema_slow = price * k_slow + self._ema_slow * (1 - k_slow)
+
+    # ── EMA 9 / 21 (1-hour, for multi-timeframe trend filter) ──────────
+
+    def _update_1h_ema(self, price: float) -> None:
+        n = len(self._bars_1h)
+        if n == 1:
+            self._ema_1h_fast = price
+            self._ema_1h_slow = price
+            return
+        k_fast = 2.0 / (C.EMA_FAST + 1)
+        k_slow = 2.0 / (C.EMA_SLOW + 1)
+        self._ema_1h_fast = price * k_fast + self._ema_1h_fast * (1 - k_fast)
+        self._ema_1h_slow = price * k_slow + self._ema_1h_slow * (1 - k_slow)
 
     # ── RSI 14 (Wilder smoothing) ───────────────────────────────────────
 
@@ -164,17 +200,6 @@ class Indicators:
                 rs = self._rsi_gains / self._rsi_losses
                 self._rsi = 100.0 - 100.0 / (1.0 + rs)
 
-    # ── Volume 20-bar average ───────────────────────────────────────────
-
-    def _update_volume_avg(self) -> None:
-        bars = self._bars_5m
-        n = min(len(bars), C.VOLUME_AVG_PERIOD)
-        if n == 0:
-            self._vol_avg = 0.0
-            return
-        total = sum(bars[-i].volume for i in range(1, n + 1))
-        self._vol_avg = total / n
-
     # ── Helpers for setups ──────────────────────────────────────────────
 
     def ema_bullish(self) -> bool:
@@ -183,13 +208,26 @@ class Indicators:
     def ema_bearish(self) -> bool:
         return self._ema_fast < self._ema_slow
 
+    def ema_1h_bullish(self) -> bool:
+        return self._ema_1h_fast > self._ema_1h_slow
+
+    def ema_1h_bearish(self) -> bool:
+        return self._ema_1h_fast < self._ema_1h_slow
+
     def rsi_in_range(self, low: float = C.VWAP_RSI_LOW, high: float = C.VWAP_RSI_HIGH) -> bool:
         return low <= self._rsi <= high
 
     def volume_spike(self, mult: float) -> bool:
-        if not self._bars_5m or self._vol_avg <= 0:
+        avg = self.volume_avg
+        if not self._bars_5m or avg <= 0:
             return False
-        return self._bars_5m[-1].volume > self._vol_avg * mult
+        return self._bars_5m[-1].volume > avg * mult
+
+    def volume_ratio(self) -> float:
+        avg = self.volume_avg
+        if not self._bars_5m or avg <= 0:
+            return 0.0
+        return self._bars_5m[-1].volume / avg
 
     def last_n_closes(self, n: int) -> List[float]:
         bars = self._bars_5m

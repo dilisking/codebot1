@@ -1,10 +1,11 @@
-"""Five trade setups — scanned in priority order.
+"""Five trade setups — scanned with confluence scoring and signal filtering.
 
-Each setup returns a TradeSignal or None. The bot runs through all five
-in priority order and takes the first valid signal per scan cycle.
+Each setup returns a TradeSignal with a confluence score. The scanner
+collects all valid signals, rejects those below the minimum confluence
+threshold, and returns the highest-scoring signal.
 
-Priority: 1) News Breakout  2) ORB Breakout  3) Session Sweep
-          4) VWAP Reclaim   5) OB Retest
+Priority tiebreaker: 1) News Breakout  2) ORB Breakout  3) Session Sweep
+                     4) VWAP Reclaim   5) OB Retest
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class TradeSignal:
     sl_ticks: int
     is_news: bool = False
     min_hold_sec: float = 0.0
+    confluence: int = 0  # 0-100 confluence score
 
     @property
     def rr(self) -> float:
@@ -68,13 +70,77 @@ def _compute_tp(entry: float, sl: float, direction: Direction) -> float:
     return entry - risk * C.MIN_RR
 
 
+# ── Confluence scoring ──────────────────────────────────────────────────────
+
+def _score_confluence(
+    ind: Indicators,
+    direction: Direction,
+    session: Optional[C.Session],
+) -> int:
+    """Score 0-100 based on how many confirming factors align."""
+    score = 0
+
+    # 5M EMA alignment (+15)
+    if direction == Direction.LONG and ind.ema_bullish():
+        score += C.CONFLUENCE_EMA_ALIGN
+    elif direction == Direction.SHORT and ind.ema_bearish():
+        score += C.CONFLUENCE_EMA_ALIGN
+
+    # RSI not in opposing extreme (+10)
+    rsi = ind.rsi
+    if direction == Direction.LONG and rsi < 70:
+        score += C.CONFLUENCE_RSI_OK
+    elif direction == Direction.SHORT and rsi > 30:
+        score += C.CONFLUENCE_RSI_OK
+
+    # Volume spike magnitude (+10 base, +20 if strong)
+    vol_ratio = ind.volume_ratio()
+    if vol_ratio > 3.0:
+        score += C.CONFLUENCE_VOL_STRONG
+    elif vol_ratio > 1.25:
+        score += C.CONFLUENCE_VOL_BASE
+
+    # VWAP alignment (+15)
+    if ind.vwap > 0:
+        if direction == Direction.LONG and ind.last_price > ind.vwap:
+            score += C.CONFLUENCE_VWAP_ALIGN
+        elif direction == Direction.SHORT and ind.last_price < ind.vwap:
+            score += C.CONFLUENCE_VWAP_ALIGN
+
+    # 1H trend alignment (+20)
+    if len(ind.bars_1h) >= 2:
+        if direction == Direction.LONG and ind.ema_1h_bullish():
+            score += C.CONFLUENCE_1H_TREND
+        elif direction == Direction.SHORT and ind.ema_1h_bearish():
+            score += C.CONFLUENCE_1H_TREND
+
+    # Session quality (+0-20)
+    if session:
+        # priority 1 → 20pts, priority 2 → 15pts, priority 3 → 10pts, priority 4 → 0pts
+        session_pts = max(0, C.CONFLUENCE_SESSION - (session.priority - 1) * 5)
+        score += session_pts
+
+    return min(100, score)
+
+
+# ── 1H trend gate (reject counter-trend trades) ────────────────────────────
+
+def _1h_trend_allows(ind: Indicators, direction: Direction) -> bool:
+    """Reject trades that fight the 1H trend. Neutral (no data) = allow."""
+    if len(ind.bars_1h) < 3:
+        return True  # Not enough data, allow
+    if direction == Direction.LONG:
+        return not ind.ema_1h_bearish()  # Allow if 1H neutral or bullish
+    return not ind.ema_1h_bullish()      # Allow if 1H neutral or bearish
+
+
 # ── Setup 1: News Breakout ──────────────────────────────────────────────────
 
 def scan_news_breakout(
     ind: Indicators,
     active_news: bool,
     now: time,
-    session: Optional[object],
+    session: Optional[C.Session],
 ) -> Optional[TradeSignal]:
     if not active_news or session is None:
         return None
@@ -92,6 +158,12 @@ def scan_news_breakout(
     bullish = bar.close > bar.open
     direction = Direction.LONG if bullish else Direction.SHORT
 
+    # Filter: require EMA alignment or at least neutral (not opposing)
+    if direction == Direction.LONG and ind.ema_bearish():
+        return None
+    if direction == Direction.SHORT and ind.ema_bullish():
+        return None
+
     if direction == Direction.LONG:
         sl = bar.low - C.TICK_BUFFER * C.TICK_SIZE
         entry = bar.close
@@ -101,8 +173,10 @@ def scan_news_breakout(
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
     tp = _compute_tp(entry, sl, direction)
+    score = _score_confluence(ind, direction, session)
 
-    log.info("NEWS BREAKOUT: dir=%s entry=%.2f sl=%.2f tp=%.2f", direction.name, entry, sl, tp)
+    log.info("NEWS BREAKOUT: dir=%s entry=%.2f sl=%.2f tp=%.2f score=%d",
+             direction.name, entry, sl, tp, score)
     return TradeSignal(
         setup=SetupType.NEWS_BREAKOUT,
         direction=direction,
@@ -110,6 +184,7 @@ def scan_news_breakout(
         sl_ticks=sl_ticks,
         is_news=True,
         min_hold_sec=C.NEWS_MIN_HOLD_SEC,
+        confluence=score,
     )
 
 
@@ -134,6 +209,11 @@ def scan_orb_breakout(
     if orb_range <= 0:
         return None
 
+    # Filter: skip if ORB range is too narrow (noise) or too wide
+    orb_ticks = _ticks(orb_range)
+    if orb_ticks < C.ORB_RANGE_MIN_TICKS or orb_ticks > C.ORB_RANGE_MAX_TICKS:
+        return None
+
     if not ind.volume_spike(C.ORB_VOLUME_MULT):
         return None
 
@@ -146,6 +226,10 @@ def scan_orb_breakout(
     if direction is None:
         return None
 
+    # 1H trend gate
+    if not _1h_trend_allows(ind, direction):
+        return None
+
     sl_dist = orb_range * C.ORB_SL_RATIO
     if direction == Direction.LONG:
         entry = price
@@ -156,14 +240,17 @@ def scan_orb_breakout(
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
     tp = _compute_tp(entry, sl, direction)
+    session = tracker.current_session(now)
+    score = _score_confluence(ind, direction, session)
 
-    log.info("ORB BREAKOUT: dir=%s entry=%.2f sl=%.2f tp=%.2f orb=[%.2f-%.2f]",
-             direction.name, entry, sl, tp, orb_low, orb_high)
+    log.info("ORB BREAKOUT: dir=%s entry=%.2f sl=%.2f tp=%.2f orb=[%.2f-%.2f] score=%d",
+             direction.name, entry, sl, tp, orb_low, orb_high, score)
     return TradeSignal(
         setup=SetupType.ORB_BREAKOUT,
         direction=direction,
         entry=entry, sl=sl, tp=tp,
         sl_ticks=sl_ticks,
+        confluence=score,
     )
 
 
@@ -196,14 +283,21 @@ def scan_session_sweep(
         # CHoCH: current price > all closes of last 8 bars
         last_closes = [bars[-i].close for i in range(2, min(C.SWEEP_CHOCH_BARS + 2, len(bars) + 1))]
         if last_closes and price > max(last_closes):
-            direction = Direction.LONG
+            # Filter: require volume confirmation on recovery candle
+            if ind.volume_spike(C.ORB_VOLUME_MULT):
+                direction = Direction.LONG
 
     if direction is None and prev_bar.high > london_high and curr_bar.close < london_high:
         last_closes = [bars[-i].close for i in range(2, min(C.SWEEP_CHOCH_BARS + 2, len(bars) + 1))]
         if last_closes and price < min(last_closes):
-            direction = Direction.SHORT
+            if ind.volume_spike(C.ORB_VOLUME_MULT):
+                direction = Direction.SHORT
 
     if direction is None:
+        return None
+
+    # 1H trend gate
+    if not _1h_trend_allows(ind, direction):
         return None
 
     if direction == Direction.LONG:
@@ -217,14 +311,17 @@ def scan_session_sweep(
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
     tp = _compute_tp(entry, sl, direction)
+    session = tracker.current_session(now)
+    score = _score_confluence(ind, direction, session)
 
-    log.info("SESSION SWEEP: dir=%s entry=%.2f sl=%.2f tp=%.2f london=[%.2f-%.2f]",
-             direction.name, entry, sl, tp, london_low, london_high)
+    log.info("SESSION SWEEP: dir=%s entry=%.2f sl=%.2f tp=%.2f london=[%.2f-%.2f] score=%d",
+             direction.name, entry, sl, tp, london_low, london_high, score)
     return TradeSignal(
         setup=SetupType.SESSION_SWEEP,
         direction=direction,
         entry=entry, sl=sl, tp=tp,
         sl_ticks=sl_ticks,
+        confluence=score,
     )
 
 
@@ -232,7 +329,7 @@ def scan_session_sweep(
 
 def scan_vwap_reclaim(
     ind: Indicators,
-    session: Optional[object],
+    session: Optional[C.Session],
     now: time,
 ) -> Optional[TradeSignal]:
     if session is None:
@@ -253,18 +350,24 @@ def scan_vwap_reclaim(
 
     direction: Optional[Direction] = None
 
-    # Bullish: some recent closes below VWAP, current above, EMA bullish, RSI OK
+    # Bullish: some recent closes below VWAP, current above, EMA bullish
+    # Tighter RSI: 25-55 for longs (recovering, not overextended)
     curr_close = bars[-1].close
-    if any_below and curr_close > vwap and ind.ema_bullish() and ind.rsi_in_range():
+    if any_below and curr_close > vwap and ind.ema_bullish() and ind.rsi_in_range(25, 55):
         if ind.volume_spike(C.VWAP_VOLUME_MULT):
             direction = Direction.LONG
 
-    # Bearish: some recent closes above VWAP, current below, EMA bearish, RSI OK
-    if direction is None and any_above and curr_close < vwap and ind.ema_bearish() and ind.rsi_in_range():
+    # Bearish: some recent closes above VWAP, current below, EMA bearish
+    # Tighter RSI: 45-75 for shorts (extended, not oversold)
+    if direction is None and any_above and curr_close < vwap and ind.ema_bearish() and ind.rsi_in_range(45, 75):
         if ind.volume_spike(C.VWAP_VOLUME_MULT):
             direction = Direction.SHORT
 
     if direction is None:
+        return None
+
+    # 1H trend gate
+    if not _1h_trend_allows(ind, direction):
         return None
 
     # SL beyond the extreme wick of last 6 candles
@@ -280,14 +383,16 @@ def scan_vwap_reclaim(
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
     tp = _compute_tp(entry, sl, direction)
+    score = _score_confluence(ind, direction, session)
 
-    log.info("VWAP RECLAIM: dir=%s entry=%.2f sl=%.2f tp=%.2f vwap=%.2f",
-             direction.name, entry, sl, tp, vwap)
+    log.info("VWAP RECLAIM: dir=%s entry=%.2f sl=%.2f tp=%.2f vwap=%.2f score=%d",
+             direction.name, entry, sl, tp, vwap, score)
     return TradeSignal(
         setup=SetupType.VWAP_RECLAIM,
         direction=direction,
         entry=entry, sl=sl, tp=tp,
         sl_ticks=sl_ticks,
+        confluence=score,
     )
 
 
@@ -299,11 +404,15 @@ def _find_order_block_1h(bars_1h: List[Bar], bullish: bool) -> Optional[Bar]:
     Bullish OB: last bearish candle immediately followed by a strong
     bullish candle that breaks above it.
     Bearish OB: opposite.
+    Limited to last OB_MAX_AGE_BARS bars to avoid stale OBs.
     """
     if len(bars_1h) < 3:
         return None
 
-    for i in range(len(bars_1h) - 2, 0, -1):
+    # Only search recent bars (OB decays over time)
+    search_start = max(1, len(bars_1h) - C.OB_MAX_AGE_BARS)
+
+    for i in range(len(bars_1h) - 2, search_start - 1, -1):
         candidate = bars_1h[i]
         follow = bars_1h[i + 1]
 
@@ -323,7 +432,7 @@ def _find_order_block_1h(bars_1h: List[Bar], bullish: bool) -> Optional[Bar]:
 
 def scan_ob_retest(
     ind: Indicators,
-    session: Optional[object],
+    session: Optional[C.Session],
     now: time,
 ) -> Optional[TradeSignal]:
     if session is None:
@@ -334,6 +443,7 @@ def scan_ob_retest(
     price = ind.last_price
     bars_1h = list(ind.bars_1h)
     direction: Optional[Direction] = None
+    ob: Optional[Bar] = None
 
     # Try bullish OB
     if ind.ema_bullish() and ind.rsi_in_range(C.OB_RSI_LOW, C.OB_RSI_HIGH):
@@ -354,16 +464,22 @@ def scan_ob_retest(
     if direction is None:
         return None
 
+    # 1H trend gate
+    if not _1h_trend_allows(ind, direction):
+        return None
+
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
     tp = _compute_tp(entry, sl, direction)
+    score = _score_confluence(ind, direction, session)
 
-    log.info("OB RETEST: dir=%s entry=%.2f sl=%.2f tp=%.2f ob=[%.2f-%.2f]",
-             direction.name, entry, sl, tp, ob.low, ob.high)
+    log.info("OB RETEST: dir=%s entry=%.2f sl=%.2f tp=%.2f ob=[%.2f-%.2f] score=%d",
+             direction.name, entry, sl, tp, ob.low, ob.high, score)
     return TradeSignal(
         setup=SetupType.OB_RETEST,
         direction=direction,
         entry=entry, sl=sl, tp=tp,
         sl_ticks=sl_ticks,
+        confluence=score,
     )
 
 
@@ -375,32 +491,46 @@ def scan_all(
     now: time,
     active_news: bool = False,
 ) -> Optional[TradeSignal]:
-    """Scan all five setups in priority order, return first valid signal."""
-    session = tracker.current_session(now)
+    """Scan all five setups, score by confluence, return the best signal.
 
-    # Priority 1: News Breakout
+    Collects all valid signals, rejects those below MIN_CONFLUENCE_SCORE,
+    and returns the highest-scoring one. On ties, setup priority wins.
+    """
+    session = tracker.current_session(now)
+    candidates: List[TradeSignal] = []
+
+    # Scan all five setups
     signal = scan_news_breakout(ind, active_news, now, session)
     if signal:
-        return signal
+        candidates.append(signal)
 
-    # Priority 2: ORB Breakout
     signal = scan_orb_breakout(ind, tracker, now)
     if signal:
-        return signal
+        candidates.append(signal)
 
-    # Priority 3: Session Sweep
     signal = scan_session_sweep(ind, tracker, now)
     if signal:
-        return signal
+        candidates.append(signal)
 
-    # Priority 4: VWAP Reclaim
     signal = scan_vwap_reclaim(ind, session, now)
     if signal:
-        return signal
+        candidates.append(signal)
 
-    # Priority 5: OB Retest
     signal = scan_ob_retest(ind, session, now)
     if signal:
-        return signal
+        candidates.append(signal)
 
-    return None
+    if not candidates:
+        return None
+
+    # Filter by minimum confluence
+    qualified = [s for s in candidates if s.confluence >= C.MIN_CONFLUENCE_SCORE]
+    if not qualified:
+        log.debug("All %d signals rejected (below confluence %d)", len(candidates), C.MIN_CONFLUENCE_SCORE)
+        return None
+
+    # Return highest confluence; on tie, first in list wins (preserves priority order)
+    best = max(qualified, key=lambda s: s.confluence)
+    if len(qualified) > 1:
+        log.info("Selected %s (score=%d) from %d candidates", best.setup.value, best.confluence, len(qualified))
+    return best

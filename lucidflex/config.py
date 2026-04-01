@@ -60,14 +60,15 @@ class Session:
     name: str
     start: time
     end: time
-    priority: int  # lower = higher priority
+    priority: int       # lower = higher priority
+    size_weight: float  # position sizing multiplier by session quality
 
 SESSIONS: List[Session] = [
-    Session("London Open",    time(3, 0),   time(5, 30),  3),
-    Session("NY Pre-Market",  time(7, 0),   time(8, 30),  2),
-    Session("NY Open",        time(8, 30),  time(11, 30), 1),
-    Session("NY Lunch",       time(11, 30), time(13, 0),  4),
-    Session("NY Afternoon",   time(13, 0),  time(15, 30), 3),
+    Session("London Open",    time(3, 0),   time(5, 30),  3, 0.70),
+    Session("NY Pre-Market",  time(7, 0),   time(8, 30),  2, 0.85),
+    Session("NY Open",        time(8, 30),  time(11, 30), 1, 1.00),
+    Session("NY Lunch",       time(11, 30), time(13, 0),  4, 0.50),
+    Session("NY Afternoon",   time(13, 0),  time(15, 30), 3, 0.70),
 ]
 
 NO_NEW_TRADES_AFTER = time(15, 45)  # 3:45 PM EST
@@ -91,6 +92,8 @@ ORB_END = time(8, 44)
 ORB_TRADE_AFTER = time(8, 45)
 ORB_VOLUME_MULT = 1.25
 ORB_SL_RATIO = 0.30             # SL at 30% of ORB range from breakout
+ORB_RANGE_MIN_TICKS = 8         # Skip ORB if range < 8 ticks (noise)
+ORB_RANGE_MAX_TICKS = 35        # Skip ORB if range > 35 ticks (too wide)
 
 SWEEP_CHOCH_BARS = 8            # CHoCH confirmation: price > all closes of last 8 bars
 
@@ -101,12 +104,33 @@ VWAP_RSI_HIGH = 75
 
 OB_RSI_LOW = 25
 OB_RSI_HIGH = 75
+OB_MAX_AGE_BARS = 15            # Only consider OBs from last 15 1H bars
 
 # ── Indicator periods ──────────────────────────────────────────────────────
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
 VOLUME_AVG_PERIOD = 20
+
+# ── Trade management thresholds ─────────────────────────────────────────────
+BREAKEVEN_R = 1.5               # Move SL to entry at 1.5R profit
+TRAIL_START_R = 2.5             # Start trailing at 2.5R profit
+TRAIL_DISTANCE_R = 1.5          # Trail stop 1.5R behind price
+STALE_TRADE_MINUTES = 20        # Close trade if open > 20 min with < 0.5R profit
+STALE_TRADE_MIN_R = 0.5         # Minimum R profit to keep a stale trade
+SESSION_END_BUFFER_MIN = 5      # Close 5 min before session end unless >2R profit
+SESSION_END_MIN_R = 2.0         # Keep trade through session end if >= 2R
+POST_LOSS_COOLDOWN_SEC = 10.0   # Pause scanning after a stop loss hit
+
+# ── Confluence scoring ──────────────────────────────────────────────────────
+MIN_CONFLUENCE_SCORE = 40       # Reject signals scoring below this
+CONFLUENCE_EMA_ALIGN = 15       # +15 for EMA alignment
+CONFLUENCE_RSI_OK = 10          # +10 for RSI not in extreme
+CONFLUENCE_VOL_BASE = 10        # +10 for volume spike (base)
+CONFLUENCE_VOL_STRONG = 20      # +20 for strong volume (>3x avg)
+CONFLUENCE_VWAP_ALIGN = 15      # +15 for price on right side of VWAP
+CONFLUENCE_1H_TREND = 20        # +20 for 1H trend alignment
+CONFLUENCE_SESSION = 20         # +20 max for session priority
 
 # ── Rithmic connection defaults ─────────────────────────────────────────────
 RITHMIC_ENV = "PAPER"

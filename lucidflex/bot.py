@@ -2,10 +2,11 @@
 
 Orchestrates the full trading lifecycle:
   1. Connect to Rithmic (paper trading)
-  2. Run the scan loop during active sessions
-  3. Execute signals with full risk management
-  4. Handle EOD settlement and MLL updates
-  5. Track progress toward the $3,000 profit target
+  2. Run the scan loop during active sessions (1s cycle)
+  3. Actively manage open positions (trailing/BE/time exits)
+  4. Execute signals with full risk management + confluence scoring
+  5. Handle EOD settlement and MLL updates
+  6. Track progress toward the $3,000 profit target
 
 Usage:
     python -m lucidflex.bot --user YOUR_USER --password YOUR_PASS --system YOUR_SYSTEM
@@ -20,6 +21,7 @@ import logging
 import os
 import signal
 import sys
+import tempfile
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -40,7 +42,7 @@ except ImportError:
     from datetime import timezone as tz
     EST = tz(timedelta(hours=-5))
 
-SCAN_INTERVAL = 5.0  # seconds between setup scans
+SCAN_INTERVAL = 1.0  # 1s scan cycle (was 5s — setups are pure in-memory computation)
 STATE_FILE = Path("lucidflex_state.json")
 
 
@@ -55,20 +57,23 @@ class TradingBot:
         self.session_tracker = SessionTracker()
         self.data_feed = RithmicDataFeed(self.indicators, self.session_tracker)
         self.execution = ExecutionEngine(self.risk_mgr)
-        self._news_times: set = set()
+        # Pre-sort news events for fast lookup via pointer
+        self._news_events: list = []
+        self._next_news_idx: int = 0
         if news_events:
+            parsed = []
             for event_str in news_events:
                 try:
-                    dt = datetime.fromisoformat(event_str)
-                    self._news_times.add(dt)
+                    parsed.append(datetime.fromisoformat(event_str))
                 except ValueError:
                     log.warning("Invalid news event time: %s", event_str)
+            self._news_events = sorted(parsed)
         self._running = False
         self._fill_monitor_task: Optional[asyncio.Task] = None
         self._data_task: Optional[asyncio.Task] = None
         self._last_vwap_reset_date: Optional[datetime] = None
 
-    # ── State persistence ───────────────────────────────────────────────
+    # ── State persistence (atomic write) ────────────────────────────────
 
     def save_state(self) -> None:
         data = {
@@ -82,8 +87,22 @@ class TradingBot:
             "challenge_passed": self.state.challenge_passed,
             "challenge_failed": self.state.challenge_failed,
         }
-        STATE_FILE.write_text(json.dumps(data, indent=2))
-        log.info("State saved to %s", STATE_FILE)
+        # Atomic write: write to temp file then rename
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=STATE_FILE.parent, suffix=".tmp", prefix=".lucidflex_state_",
+            )
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, STATE_FILE)
+            log.info("State saved to %s", STATE_FILE)
+        except Exception:
+            log.exception("Failed to save state")
+            # Clean up temp file if rename failed
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def load_state(self) -> None:
         if not STATE_FILE.exists():
@@ -118,12 +137,22 @@ class TradingBot:
         return datetime.now(EST).time()
 
     def _is_news_active(self) -> bool:
+        """O(1) news check using sorted events and a pointer."""
+        if not self._news_events:
+            return False
         now = self.now_est()
-        for event_time in self._news_times:
-            delta = abs((now - event_time).total_seconds())
-            if delta < 600:  # within 10 minutes of event
-                return True
-        return False
+
+        # Advance pointer past expired events (>10min ago)
+        while (self._next_news_idx < len(self._news_events) and
+               (now - self._news_events[self._next_news_idx]).total_seconds() > 600):
+            self._next_news_idx += 1
+
+        if self._next_news_idx >= len(self._news_events):
+            return False
+
+        # Check if the next event is within 10 minutes
+        delta = abs((now - self._news_events[self._next_news_idx]).total_seconds())
+        return delta < 600
 
     def _should_trade(self) -> bool:
         t = self.time_est()
@@ -163,10 +192,10 @@ class TradingBot:
         self.save_state()
 
         if self.state.challenge_passed:
-            log.info("🏆 CHALLENGE PASSED — Profit: $%.2f in %d days",
+            log.info("CHALLENGE PASSED — Profit: $%.2f in %d days",
                      self.state.total_profit, self.state.trading_days)
         elif self.state.challenge_failed:
-            log.critical("❌ CHALLENGE FAILED — equity below MLL")
+            log.critical("CHALLENGE FAILED — equity below MLL")
 
     # ── Main scan loop ──────────────────────────────────────────────────
 
@@ -210,27 +239,36 @@ class TradingBot:
                     self._running = False
                     break
 
-                # Skip if outside trading hours or risk limits hit
-                if not self._should_trade() or not self.risk_mgr.can_trade():
-                    await asyncio.sleep(SCAN_INTERVAL)
-                    continue
+                current_price = self.data_feed.last_price or self.indicators.last_price
+                session = self.session_tracker.current_session(t)
 
-                # Don't scan if we already have open positions
+                # Always manage open positions (trailing, BE, time exits)
                 if self.execution.has_position:
+                    await self.execution.manage_positions(current_price, t, session)
+
+                # Skip new trades if outside hours, risk limits hit, or in cooldown
+                if (not self._should_trade() or
+                        not self.risk_mgr.can_trade() or
+                        self.execution.in_cooldown):
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
-                # Scan for setups
-                signal = scan_all(
-                    self.indicators,
-                    self.session_tracker,
-                    t,
-                    active_news=self._is_news_active(),
-                )
+                # Only scan for new entries when flat
+                if not self.execution.has_position:
+                    signal = scan_all(
+                        self.indicators,
+                        self.session_tracker,
+                        t,
+                        active_news=self._is_news_active(),
+                    )
 
-                if signal:
-                    log.info("Signal detected: %s %s", signal.setup.value, signal.direction.name)
-                    await self.execution.execute_signal(signal)
+                    if signal:
+                        # Pass session weight for position sizing
+                        sw = session.size_weight if session else 0.7
+                        log.info("Signal: %s %s (score=%d, session=%s)",
+                                 signal.setup.value, signal.direction.name,
+                                 signal.confluence, session.name if session else "none")
+                        await self.execution.execute_signal(signal, session_weight=sw)
 
                 await asyncio.sleep(SCAN_INTERVAL)
 
@@ -244,7 +282,7 @@ class TradingBot:
 
     async def start(self) -> None:
         log.info("=" * 60)
-        log.info("LucidFlex 50K Gold Futures Trading Bot")
+        log.info("LucidFlex 50K Gold Futures Trading Bot v2 (Optimized)")
         log.info("=" * 60)
 
         self.load_state()
@@ -266,7 +304,7 @@ class TradingBot:
         self._data_task = asyncio.create_task(self.data_feed.process_ticks())
         self._fill_monitor_task = asyncio.create_task(self.execution.monitor_fills())
 
-        log.info("Bot started — scanning for setups")
+        log.info("Bot started — 1s scan cycle, active trade management enabled")
         log.info(
             "State: equity=$%.2f MLL=$%.2f buffer=$%.2f profit=$%.2f target=$%.2f days=%d",
             self.state.equity, self.state.current_mll, self.state.mll_buffer,
