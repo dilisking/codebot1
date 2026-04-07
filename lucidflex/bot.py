@@ -240,6 +240,10 @@ class TradingBot:
                     break
 
                 current_price = self.data_feed.last_price or self.indicators.last_price
+                if current_price <= 0:
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+
                 session = self.session_tracker.current_session(t)
 
                 # Always manage open positions (trailing, BE, time exits)

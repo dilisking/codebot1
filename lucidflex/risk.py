@@ -107,11 +107,18 @@ class RiskManager:
         sl_ticks: int,
         is_news: bool = False,
         session_weight: float = 1.0,
+        win_streak: int = 0,
     ) -> int:
         sl_ticks = max(C.SL_TICK_MIN, min(C.SL_TICK_MAX, sl_ticks))
 
         # Scale risk by session quality (NY Open=1.0, Lunch=0.5, etc.)
-        risk_dollars = self.state.equity * C.RISK_PCT * session_weight
+        streak_mult = 1.0
+        if win_streak >= C.WIN_STREAK_BOOST_AFTER:
+            streak_mult = C.WIN_STREAK_BOOST_MULT
+
+        # Recovery mode: halve risk when MLL buffer is dangerously low
+        recovery_mult = 0.5 if self.state.mll_buffer < 500.0 else 1.0
+        risk_dollars = self.state.equity * C.RISK_PCT * session_weight * streak_mult * recovery_mult
         raw_qty = int(risk_dollars / (sl_ticks * C.MGC_TICK_VALUE))
 
         cap = self.max_contracts()
@@ -193,6 +200,10 @@ class RiskManager:
             log.critical("CHALLENGE FAILED: equity $%.2f < MLL $%.2f", closing_equity, s.current_mll)
             return
 
+        # Increment trading days BEFORE pass check (so current day counts)
+        if abs(today_pnl) > 10.0:
+            s.trading_days += 1
+
         # Check pass
         if s.passed():
             s.challenge_passed = True
@@ -202,10 +213,6 @@ class RiskManager:
                 (s.best_single_day / s.total_profit * 100) if s.total_profit > 0 else 0,
             )
             return
-
-        # Increment trading days (only if meaningful trading occurred)
-        if abs(today_pnl) > 10.0:
-            s.trading_days += 1
 
         # Reset daily counters
         s.day_pnl = 0.0

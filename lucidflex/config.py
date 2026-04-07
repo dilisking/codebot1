@@ -132,6 +132,17 @@ CONFLUENCE_VWAP_ALIGN = 15      # +15 for price on right side of VWAP
 CONFLUENCE_1H_TREND = 20        # +20 for 1H trend alignment
 CONFLUENCE_SESSION = 20         # +20 max for session priority
 
+# ── ATR volatility filter ───────────────────────────────────────────────────
+ATR_PERIOD = 14                 # ATR lookback period (5-minute bars)
+ATR_MIN_TICKS = 4               # Skip trading if ATR < 4 ticks (dead market)
+ATR_HIGH_MULT = 1.5             # ATR > 1.5x its 20-bar avg = high volatility
+ATR_ADAPTIVE_TP_MULT = 1.3      # Extend TP by 30% when ATR is high (up to 6R)
+ATR_ADAPTIVE_TP_MAX_RR = 6.0    # Cap adaptive TP at 6R
+
+# ── Win-streak momentum sizing ──────────────────────────────────────────────
+WIN_STREAK_BOOST_AFTER = 2      # Boost sizing after 2 consecutive wins
+WIN_STREAK_BOOST_MULT = 1.2     # 1.2x position size on streak (capped by Layer 3)
+
 # ── Rithmic connection defaults ─────────────────────────────────────────────
 RITHMIC_ENV = "PAPER"
 RITHMIC_GATEWAY = "paper.rithmic.com"

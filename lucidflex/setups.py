@@ -63,11 +63,14 @@ def _clamp_sl_ticks(ticks: int) -> int:
     return max(C.SL_TICK_MIN, min(C.SL_TICK_MAX, ticks))
 
 
-def _compute_tp(entry: float, sl: float, direction: Direction) -> float:
+def _compute_tp(entry: float, sl: float, direction: Direction, atr_high: bool = False) -> float:
     risk = abs(entry - sl)
+    rr = C.MIN_RR
+    if atr_high:
+        rr = min(C.MIN_RR * C.ATR_ADAPTIVE_TP_MULT, C.ATR_ADAPTIVE_TP_MAX_RR)
     if direction == Direction.LONG:
-        return entry + risk * C.MIN_RR
-    return entry - risk * C.MIN_RR
+        return entry + risk * rr
+    return entry - risk * rr
 
 
 # ── Confluence scoring ──────────────────────────────────────────────────────
@@ -172,7 +175,7 @@ def scan_news_breakout(
         entry = bar.close
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
-    tp = _compute_tp(entry, sl, direction)
+    tp = _compute_tp(entry, sl, direction, atr_high=ind.atr_is_high)
     score = _score_confluence(ind, direction, session)
 
     log.info("NEWS BREAKOUT: dir=%s entry=%.2f sl=%.2f tp=%.2f score=%d",
@@ -239,7 +242,7 @@ def scan_orb_breakout(
         sl = orb_low + sl_dist
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
-    tp = _compute_tp(entry, sl, direction)
+    tp = _compute_tp(entry, sl, direction, atr_high=ind.atr_is_high)
     session = tracker.current_session(now)
     score = _score_confluence(ind, direction, session)
 
@@ -310,7 +313,7 @@ def scan_session_sweep(
         entry = price
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
-    tp = _compute_tp(entry, sl, direction)
+    tp = _compute_tp(entry, sl, direction, atr_high=ind.atr_is_high)
     session = tracker.current_session(now)
     score = _score_confluence(ind, direction, session)
 
@@ -382,7 +385,7 @@ def scan_vwap_reclaim(
         entry = price
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
-    tp = _compute_tp(entry, sl, direction)
+    tp = _compute_tp(entry, sl, direction, atr_high=ind.atr_is_high)
     score = _score_confluence(ind, direction, session)
 
     log.info("VWAP RECLAIM: dir=%s entry=%.2f sl=%.2f tp=%.2f vwap=%.2f score=%d",
@@ -469,7 +472,7 @@ def scan_ob_retest(
         return None
 
     sl_ticks = _clamp_sl_ticks(_ticks(entry - sl))
-    tp = _compute_tp(entry, sl, direction)
+    tp = _compute_tp(entry, sl, direction, atr_high=ind.atr_is_high)
     score = _score_confluence(ind, direction, session)
 
     log.info("OB RETEST: dir=%s entry=%.2f sl=%.2f tp=%.2f ob=[%.2f-%.2f] score=%d",
@@ -495,7 +498,12 @@ def scan_all(
 
     Collects all valid signals, rejects those below MIN_CONFLUENCE_SCORE,
     and returns the highest-scoring one. On ties, setup priority wins.
+    Skips entirely if ATR indicates a dead market.
     """
+    # ATR volatility gate: skip scanning if market is dead/choppy
+    if ind.atr_too_low:
+        return None
+
     session = tracker.current_session(now)
     candidates: List[TradeSignal] = []
 

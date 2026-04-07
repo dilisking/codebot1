@@ -95,6 +95,7 @@ class ExecutionEngine:
         self._position: int = 0  # net MGC contracts (+ long, - short)
         self._connected = False
         self._last_loss_time: float = 0.0  # monotonic time of last SL hit
+        self._win_streak: int = 0          # consecutive winning trades
 
     @property
     def has_position(self) -> bool:
@@ -157,6 +158,7 @@ class ExecutionEngine:
             signal.sl_ticks,
             is_news=signal.is_news,
             session_weight=session_weight,
+            win_streak=self._win_streak,
         )
         if qty <= 0:
             log.warning("Position sizing returned 0 — skipping trade")
@@ -314,17 +316,20 @@ class ExecutionEngine:
             # Update risk manager
             self.risk_mgr.update_equity_realtime(trade.pnl)
 
-            # Track loss for cooldown
+            # Track loss for cooldown and win streak
             if trade.pnl < 0:
                 self._last_loss_time = time_mod.monotonic()
+                self._win_streak = 0
+            elif trade.pnl > 0:
+                self._win_streak += 1
 
             self._open_trades.pop(trade.order_id, None)
             self._closed_trades.append(trade)
 
             log.info(
-                "TRADE CLOSED [%s]: %s PnL=$%.2f held=%.1fs | %s",
+                "TRADE CLOSED [%s]: %s PnL=$%.2f held=%.1fs streak=%d | %s",
                 reason, trade.signal.setup.value, trade.pnl,
-                trade.hold_seconds, trade.signal.setup.value,
+                trade.hold_seconds, self._win_streak, trade.signal.setup.value,
             )
 
         except Exception:
@@ -391,9 +396,12 @@ class ExecutionEngine:
 
                         self.risk_mgr.update_equity_realtime(trade.pnl)
 
-                        # Track loss for cooldown
+                        # Track loss for cooldown and win streak
                         if trade.pnl < 0:
                             self._last_loss_time = time_mod.monotonic()
+                            self._win_streak = 0
+                        elif trade.pnl > 0:
+                            self._win_streak += 1
 
                         # Cancel the other bracket leg
                         other = trade.tp_order_id if reason == "SL_HIT" else trade.sl_order_id

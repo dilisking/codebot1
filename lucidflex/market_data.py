@@ -42,6 +42,7 @@ class Indicators:
         "_vwap", "_ema_fast", "_ema_slow", "_rsi", "_rsi_gains",
         "_rsi_losses", "_vol_sum", "_vol_count",
         "_ema_1h_fast", "_ema_1h_slow",
+        "_atr", "_atr_avg", "_atr_values",
     )
 
     def __init__(self) -> None:
@@ -61,6 +62,10 @@ class Indicators:
         # 1H EMA for multi-timeframe trend filter
         self._ema_1h_fast: float = 0.0
         self._ema_1h_slow: float = 0.0
+        # ATR for volatility filtering
+        self._atr: float = 0.0
+        self._atr_avg: float = 0.0
+        self._atr_values: Deque[float] = deque(maxlen=C.VOLUME_AVG_PERIOD)
 
     # ── Public accessors ────────────────────────────────────────────────
 
@@ -106,6 +111,28 @@ class Indicators:
     def ema_1h_slow(self) -> float:
         return self._ema_1h_slow
 
+    @property
+    def atr(self) -> float:
+        return self._atr
+
+    @property
+    def atr_avg(self) -> float:
+        return self._atr_avg
+
+    @property
+    def atr_ticks(self) -> float:
+        return self._atr / C.TICK_SIZE if self._atr > 0 else 0.0
+
+    @property
+    def atr_is_high(self) -> bool:
+        """True when current ATR > 1.5x its own 20-bar average (high vol)."""
+        return self._atr_avg > 0 and self._atr > self._atr_avg * C.ATR_HIGH_MULT
+
+    @property
+    def atr_too_low(self) -> bool:
+        """True when ATR < minimum threshold (dead/choppy market)."""
+        return self.atr_ticks < C.ATR_MIN_TICKS
+
     # ── VWAP reset (daily at 6 PM EST / CME open) ──────────────────────
 
     def reset_vwap(self) -> None:
@@ -130,6 +157,7 @@ class Indicators:
         self._update_vwap(bar)
         self._update_ema(bar.close)
         self._update_rsi(bar.close)
+        self._update_atr(bar)
 
     def update_1h(self, bar: Bar) -> None:
         self._bars_1h.append(bar)
@@ -199,6 +227,43 @@ class Indicators:
             else:
                 rs = self._rsi_gains / self._rsi_losses
                 self._rsi = 100.0 - 100.0 / (1.0 + rs)
+
+    # ── ATR (Average True Range) ──────────────────────────────────────
+
+    def _update_atr(self, bar: Bar) -> None:
+        n = len(self._bars_5m)
+        if n < 2:
+            self._atr = bar.high - bar.low
+            return
+        prev = self._bars_5m[-2]
+        tr = max(
+            bar.high - bar.low,
+            abs(bar.high - prev.close),
+            abs(bar.low - prev.close),
+        )
+        if n <= C.ATR_PERIOD + 1:
+            # Build-up phase: simple average
+            if n == C.ATR_PERIOD + 1:
+                recent = list(self._bars_5m)[-C.ATR_PERIOD:]
+                trs = []
+                for i in range(1, len(recent)):
+                    trs.append(max(
+                        recent[i].high - recent[i].low,
+                        abs(recent[i].high - recent[i - 1].close),
+                        abs(recent[i].low - recent[i - 1].close),
+                    ))
+                trs.append(tr)
+                self._atr = sum(trs) / len(trs)
+            else:
+                self._atr = tr
+        else:
+            # Wilder smoothing
+            self._atr = (self._atr * (C.ATR_PERIOD - 1) + tr) / C.ATR_PERIOD
+
+        # Rolling average of ATR itself (for detecting high-vol)
+        self._atr_values.append(self._atr)
+        if len(self._atr_values) > 0:
+            self._atr_avg = sum(self._atr_values) / len(self._atr_values)
 
     # ── Helpers for setups ──────────────────────────────────────────────
 
@@ -274,7 +339,9 @@ class SessionTracker:
         # ORB: 8:30-8:44 AM
         if time(8, 30) <= t <= time(8, 44):
             self.orb_range.update(bar)
-            if t >= time(8, 44):
+            # 8:40 bar is the last 5m bar within ORB window (8:30-8:44);
+            # when it completes and is fed here, ORB is fully built
+            if t >= time(8, 40):
                 self.orb_built = True
 
     def current_session(self, t: time) -> Optional[C.Session]:
