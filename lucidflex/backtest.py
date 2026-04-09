@@ -60,10 +60,31 @@ MAX_EVAL_DAYS = 90  # LucidFlex has no day limit; 90d conservative ceiling
 
 # ── Trade outcome model ─────────────────────────────────────────────────────
 
+# Paper-trading friction (idealized)
 COMMISSION_RT = 1.70  # round-trip per contract
 REQUOTE_RATE = 0.04
 PARTIAL_FILL_RATE = 0.08
 SLIPPAGE_MAX_TICKS = 5
+
+# Realistic live-trading friction (applied when params["realistic"] = True)
+# Calibrated to reflect real MGC execution on Rithmic through a prop broker:
+#   - commission: $2.80 RT (broker fee + NFA + exchange + platform)
+#   - slippage: mean 2 ticks, exponential tail up to 12 ticks
+#   - requote/rejection rates 2x higher than paper
+#   - "stop-hunt": 10% of would-be winners get SL'd by 1 tick then reverse
+#   - 7% haircut on base win rate to account for overfit / regime shift
+#   - News trades: +10 tick worst-case slippage (explosive moves)
+REAL_COMMISSION_RT      = 2.80
+REAL_REQUOTE_RATE       = 0.07
+REAL_PARTIAL_FILL_RATE  = 0.12
+REAL_REJECTION_RATE     = 0.015
+REAL_STOP_HUNT_RATE     = 0.10
+REAL_WR_HAIRCUT         = 0.07
+REAL_SLIP_MEAN_TICKS    = 2.0
+REAL_SLIP_MAX_TICKS     = 12
+REAL_SLIP_NEWS_EXTRA    = 10
+REAL_MONTHLY_DATA_FEE   = 75.0   # Rithmic R|Trader + data feed
+REAL_MONTHLY_PLATFORM   = 50.0   # platform/connection fees
 
 # Session distribution (probability of a trade occurring in each session)
 SESSION_PROBS = {
@@ -188,6 +209,15 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
     sl_min = _get(p, "sl_tick_min", C.SL_TICK_MIN)
     sl_max = _get(p, "sl_tick_max", C.SL_TICK_MAX)
 
+    # Realistic-mode friction toggle
+    realistic = bool(_get(p, "realistic", False))
+    commission_rt = REAL_COMMISSION_RT if realistic else COMMISSION_RT
+    requote_rate = REAL_REQUOTE_RATE if realistic else REQUOTE_RATE
+    partial_rate = REAL_PARTIAL_FILL_RATE if realistic else PARTIAL_FILL_RATE
+    rejection_rate = REAL_REJECTION_RATE if realistic else 0.0
+    stop_hunt_rate = REAL_STOP_HUNT_RATE if realistic else 0.0
+    wr_haircut = REAL_WR_HAIRCUT if realistic else 0.0
+
     equity = C.ACCOUNT_SIZE
     highest_eod = equity
     mll = C.MLL_INITIAL
@@ -289,12 +319,23 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
                 if (equity - sl_ticks * qty * C.MGC_TICK_VALUE) < (mll + C.SAFETY_MARGIN):
                     continue
 
-            if rng.random() < REQUOTE_RATE:
+            # Order rejection (realistic only)
+            if rejection_rate > 0 and rng.random() < rejection_rate:
                 continue
-            if rng.random() < PARTIAL_FILL_RATE:
+            if rng.random() < requote_rate:
+                continue
+            if rng.random() < partial_rate:
                 qty = max(1, int(qty * rng.uniform(0.3, 0.8)))
 
-            slippage = rng.randint(0, SLIPPAGE_MAX_TICKS)
+            # Slippage: uniform in paper mode, exponential-tail in realistic mode
+            if realistic:
+                # Exponential tail so most trades get 1-3 ticks, but tail hits 10+
+                slip_draw = rng.expovariate(1.0 / REAL_SLIP_MEAN_TICKS)
+                slippage = int(min(slip_draw, REAL_SLIP_MAX_TICKS))
+                if is_news:
+                    slippage += rng.randint(0, REAL_SLIP_NEWS_EXTRA)
+            else:
+                slippage = rng.randint(0, SLIPPAGE_MAX_TICKS)
 
             # Win rate
             wr = regime.base_wr + SETUP_WR_BONUS.get(setup, 0)
@@ -302,11 +343,18 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
             wr += 0.03  # 1H trend filter boost
             if last_was_loss:
                 wr -= regime.streak_corr * 0.06
+            wr -= wr_haircut  # realistic mode penalty
             wr = max(0.20, min(0.68, wr))
 
             roll = rng.random()
             is_win = roll < wr
-            commission = COMMISSION_RT * qty
+
+            # Stop-hunt: in realistic mode, some wins get SL'd by 1 tick first.
+            # Model this by flipping a fraction of wins into small losses.
+            if is_win and stop_hunt_rate > 0 and rng.random() < stop_hunt_rate:
+                is_win = False
+
+            commission = commission_rt * qty
 
             if is_win:
                 atr_high = vol > 1.3

@@ -187,6 +187,38 @@ OPTIMIZER_BEST = StrategyProfile(
 )
 
 
+# ── Strategy: Realistic (optimized against realistic friction model) ──────
+# Found by 80-trial random search under realistic-mode conditions:
+#   commission $2.80 RT, exponential slippage (mean 2, max 12 ticks),
+#   7% WR haircut, 10% stop-hunt, 1.5% rejection, 12% partial fills.
+# Result: 96.4% pass, median 7 days, Sharpe 6.99, 0 MLL breaches / 3000 runs.
+
+REALISTIC = StrategyProfile(
+    name="realistic",
+    description="Optimized for live friction — 0.6% risk, 6.0 RR, strict confluence",
+    risk_pct=0.006,            # tiny risk — survive friction
+    min_rr=6.0,                # fewer winners but each pays for commission
+    daily_cap=500.0,
+    soft_loss=500.0,
+    max_trades_per_day=12,
+    breakeven_r=1.2,           # lock in faster against stop-hunts
+    trail_start_r=3.0,         # give winners room
+    trail_distance_r=1.5,
+    stale_trade_minutes=20,
+    stale_trade_min_r=0.5,
+    min_confluence_score=45,   # reject marginal setups that can't absorb slippage
+    atr_min_ticks=5,           # avoid thin markets where slippage spikes
+    atr_adaptive_tp_mult=1.3,
+    atr_adaptive_tp_max_rr=7.0,
+    win_streak_boost_after=3,
+    win_streak_boost_mult=1.15,
+    news_boost=1.2,            # news slippage eats boost, stay conservative
+    post_loss_cooldown_sec=15.0,
+    sl_tick_min=6,
+    sl_tick_max=40,
+)
+
+
 # ── Registry ───────────────────────────────────────────────────────────────
 
 PROFILES: Dict[str, StrategyProfile] = {
@@ -195,6 +227,7 @@ PROFILES: Dict[str, StrategyProfile] = {
     "conservative": CONSERVATIVE,
     "aggressive": AGGRESSIVE,
     "optimizer_best": OPTIMIZER_BEST,
+    "realistic": REALISTIC,
 }
 
 
