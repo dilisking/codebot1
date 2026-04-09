@@ -1,17 +1,18 @@
 """Monte Carlo Backtesting Engine — LucidFlex 50K Evaluation Simulator.
 
-Simulates 25,000 full evaluation runs under adversarial conditions:
+Supports parameterized strategy profiles for A/B comparison testing.
+Simulates full evaluation runs under adversarial conditions:
   - GARCH(1,1) stochastic volatility
   - 8 market regimes (trending, ranging, choppy, crisis)
   - Correlated setup failures (losing streaks cluster)
-  - Realistic commissions ($1.70/rt), slippage (0-10 ticks), requotes (6%)
-  - Partial fills (12%), variable fill rates
-  - Session-weighted signal generation matching real GC distributions
-  - Full MLL protection, consistency rule, and daily cap enforcement
+  - Realistic commissions ($1.70/rt), slippage (0-5 ticks), requotes (4%)
+  - Partial fills (8%), variable fill rates
+  - Full MLL protection, consistency rule, daily cap enforcement
   - Breakeven moves, trailing stops, stale trade exits
 
 Usage:
     python -m lucidflex.backtest [--runs 25000] [--seed 42] [--workers 8]
+    python -m lucidflex.backtest --strategy high_volume --runs 10000
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import time as time_mod
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from lucidflex import config as C
 
@@ -145,10 +146,47 @@ class RunResult:
     exit_reason: str
 
 
-def simulate_run(seed: int) -> RunResult:
-    """Simulate one full LucidFlex 50K evaluation."""
+def _get(p: Optional[Dict], key: str, default):
+    """Read from strategy params dict, falling back to default."""
+    if p and key in p:
+        return p[key]
+    return default
+
+
+# Module-level params dict for multiprocessing (set by run_batch_with_params)
+_SIM_PARAMS: Optional[Dict] = None
+
+
+def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
+    """Simulate one full LucidFlex 50K evaluation.
+
+    Args:
+        seed: RNG seed for reproducibility.
+        params: Optional strategy parameter overrides. Keys match
+                StrategyProfile field names. Falls back to config.py defaults.
+    """
+    p = params or _SIM_PARAMS
     rng = random.Random(seed)
     garch = GARCHVol(rng)
+
+    # Read strategy params with config.py fallbacks
+    risk_pct = _get(p, "risk_pct", C.RISK_PCT)
+    min_rr = _get(p, "min_rr", C.MIN_RR)
+    daily_cap = _get(p, "daily_cap", C.DAILY_CAP)
+    soft_loss = _get(p, "soft_loss", C.SOFT_LOSS)
+    max_trades = _get(p, "max_trades_per_day", C.MAX_TRADES_PER_DAY)
+    breakeven_r = _get(p, "breakeven_r", C.BREAKEVEN_R)
+    trail_start_r = _get(p, "trail_start_r", C.TRAIL_START_R)
+    trail_distance_r = _get(p, "trail_distance_r", C.TRAIL_DISTANCE_R)
+    min_confluence = _get(p, "min_confluence_score", C.MIN_CONFLUENCE_SCORE)
+    atr_min_ticks = _get(p, "atr_min_ticks", C.ATR_MIN_TICKS)
+    atr_tp_mult = _get(p, "atr_adaptive_tp_mult", C.ATR_ADAPTIVE_TP_MULT)
+    atr_tp_max = _get(p, "atr_adaptive_tp_max_rr", C.ATR_ADAPTIVE_TP_MAX_RR)
+    streak_after = _get(p, "win_streak_boost_after", C.WIN_STREAK_BOOST_AFTER)
+    streak_mult_val = _get(p, "win_streak_boost_mult", C.WIN_STREAK_BOOST_MULT)
+    news_boost = _get(p, "news_boost", C.NEWS_BOOST)
+    sl_min = _get(p, "sl_tick_min", C.SL_TICK_MIN)
+    sl_max = _get(p, "sl_tick_max", C.SL_TICK_MAX)
 
     equity = C.ACCOUNT_SIZE
     highest_eod = equity
@@ -167,34 +205,29 @@ def simulate_run(seed: int) -> RunResult:
     max_days = MAX_EVAL_DAYS
 
     for day in range(1, max_days + 1):
-        # Select regime for the day
         regime = rng.choices(REGIMES, weights=REGIME_WEIGHTS, k=1)[0]
         vol = garch.step() * regime.vol_mult
         day_pnl = 0.0
         day_trades = 0
         mll_breached = False
 
-        # How many trade opportunities today
         n_opportunities = max(1, int(rng.gauss(regime.avg_trades_per_day, 1.5)))
-        n_opportunities = min(n_opportunities, C.MAX_TRADES_PER_DAY)
+        n_opportunities = min(n_opportunities, max_trades)
 
-        # Correlated failure model: if previous trade lost, next is more likely to lose
         last_was_loss = False
 
         for _ in range(n_opportunities):
             # Daily limits
-            daily_cap = min(C.DAILY_CAP, max(150.0, max(C.PROFIT_TARGET, best_day / C.CONSISTENCY_LIMIT) - total_profit))
-            if day_pnl >= daily_cap:
+            cap_today = min(daily_cap, max(150.0, max(C.PROFIT_TARGET, best_day / C.CONSISTENCY_LIMIT) - total_profit))
+            if day_pnl >= cap_today:
                 break
-            if day_pnl <= -C.SOFT_LOSS:
+            if day_pnl <= -soft_loss:
                 break
 
-            # MLL hard stop
             buffer = equity - mll
             if buffer <= C.HARD_STOP_BUF:
                 break
 
-            # Select session
             session = rng.choices(
                 list(SESSION_PROBS.keys()),
                 weights=list(SESSION_PROBS.values()),
@@ -202,7 +235,6 @@ def simulate_run(seed: int) -> RunResult:
             )[0]
             is_news = (session == "News")
 
-            # Session weight for sizing
             sw_map = {
                 "London Open": 0.70, "NY Pre-Market": 0.85,
                 "NY Open": 1.00, "NY Lunch": 0.50,
@@ -210,34 +242,33 @@ def simulate_run(seed: int) -> RunResult:
             }
             session_weight = sw_map[session]
 
-            # Select setup
             setups = list(SETUP_WR_BONUS.keys())
             setup = rng.choice(setups)
             if is_news:
                 setup = "NewsBreakout"
 
-            # Confluence filter: ~30% of raw signals rejected (below threshold)
+            # Confluence filter
             confluence_score = rng.randint(20, 95)
-            if confluence_score < C.MIN_CONFLUENCE_SCORE:
+            if confluence_score < min_confluence:
                 continue
 
-            # ATR filter: reject signals in dead markets
+            # ATR filter
             if regime.name == "Low Volatility" and rng.random() < 0.25:
                 continue
-            if rng.random() < 0.05:  # random ATR-too-low moments
+            atr_reject = 0.05 if atr_min_ticks >= 4 else 0.03
+            if rng.random() < atr_reject:
                 continue
 
-            # Determine SL ticks
-            base_sl = rng.randint(C.SL_TICK_MIN, min(25, C.SL_TICK_MAX))
-            sl_ticks = max(C.SL_TICK_MIN, min(C.SL_TICK_MAX, int(base_sl * vol)))
+            # SL ticks
+            base_sl = rng.randint(sl_min, min(25, sl_max))
+            sl_ticks = max(sl_min, min(sl_max, int(base_sl * vol)))
 
-            # Position sizing (with session weight, win streak, recovery mode)
-            streak_mult = C.WIN_STREAK_BOOST_MULT if win_streak >= C.WIN_STREAK_BOOST_AFTER else 1.0
+            # Position sizing
+            s_mult = streak_mult_val if win_streak >= streak_after else 1.0
             recovery_mult = 0.5 if buffer < 500.0 else 1.0
-            risk_dollars = equity * C.RISK_PCT * session_weight * streak_mult * recovery_mult
+            risk_dollars = equity * risk_pct * session_weight * s_mult * recovery_mult
             qty = int(risk_dollars / (sl_ticks * C.MGC_TICK_VALUE))
 
-            # Dynamic cap
             if buffer < C.MLL_REDUCE_800_THRESH:
                 cap = C.MLL_REDUCE_800_CAP
             elif buffer < C.MLL_REDUCE_1200_THRESH:
@@ -247,10 +278,10 @@ def simulate_run(seed: int) -> RunResult:
 
             qty = min(qty, cap)
             if is_news:
-                qty = min(cap, int(qty * C.NEWS_BOOST))
+                qty = min(cap, int(qty * news_boost))
             qty = max(1, qty)
 
-            # Pre-trade safety (Layer 2)
+            # Layer 2 safety
             max_loss = sl_ticks * qty * C.MGC_TICK_VALUE
             if (equity - max_loss) < (mll + C.SAFETY_MARGIN):
                 while qty > 1 and (equity - sl_ticks * qty * C.MGC_TICK_VALUE) < (mll + C.SAFETY_MARGIN):
@@ -258,88 +289,63 @@ def simulate_run(seed: int) -> RunResult:
                 if (equity - sl_ticks * qty * C.MGC_TICK_VALUE) < (mll + C.SAFETY_MARGIN):
                     continue
 
-            # Requote check
             if rng.random() < REQUOTE_RATE:
                 continue
-
-            # Partial fill
             if rng.random() < PARTIAL_FILL_RATE:
                 qty = max(1, int(qty * rng.uniform(0.3, 0.8)))
 
-            # Slippage (ticks)
             slippage = rng.randint(0, SLIPPAGE_MAX_TICKS)
 
-            # Win rate calculation
+            # Win rate
             wr = regime.base_wr + SETUP_WR_BONUS.get(setup, 0)
-            # Confluence boost: higher score = better WR
-            wr += (confluence_score - 50) * 0.001  # +/- 0.5% per 10 pts
-            # 1H trend filter would have removed counter-trend, so boost remaining
-            wr += 0.03
-            # Correlated failure (reduced by confluence + 1H filter decorrelation)
+            wr += (confluence_score - 50) * 0.001
+            wr += 0.03  # 1H trend filter boost
             if last_was_loss:
                 wr -= regime.streak_corr * 0.06
             wr = max(0.20, min(0.68, wr))
 
-            # Determine trade outcome
             roll = rng.random()
             is_win = roll < wr
-
-            # Commission
             commission = COMMISSION_RT * qty
 
             if is_win:
-                # Determine exit type and R-multiple
-                # With trailing stops and adaptive TP, winners can capture more
                 atr_high = vol > 1.3
-                base_rr = C.MIN_RR
+                base_rr = min_rr
                 if atr_high:
-                    base_rr = min(C.MIN_RR * C.ATR_ADAPTIVE_TP_MULT, C.ATR_ADAPTIVE_TP_MAX_RR)
+                    base_rr = min(min_rr * atr_tp_mult, atr_tp_max)
 
-                # Distribution of winning outcomes:
-                # 45% hit full TP, 25% trail stop exit (2.5-4R), 15% breakeven,
-                # 10% session end, 5% stale exit
                 outcome_roll = rng.random()
                 if outcome_roll < 0.45:
-                    # Full TP hit
                     r_captured = base_rr
                     exit_type = "TP"
                 elif outcome_roll < 0.70:
-                    # Trailing stop exit (1.5R to base_rr)
-                    r_captured = rng.uniform(C.TRAIL_DISTANCE_R, base_rr * 0.9)
+                    r_captured = rng.uniform(trail_distance_r, base_rr * 0.9)
                     exit_type = "TRAIL"
                 elif outcome_roll < 0.85:
-                    # Breakeven + small profit
                     r_captured = rng.uniform(0.1, 0.8)
                     exit_type = "BE_SL"
                 elif outcome_roll < 0.95:
-                    # Session end exit
                     r_captured = rng.uniform(0.3, 2.0)
                     exit_type = "SESSION_END"
                 else:
-                    # Stale exit (small profit)
                     r_captured = rng.uniform(0.1, 0.4)
                     exit_type = "STALE"
 
                 gross = r_captured * sl_ticks * qty * C.MGC_TICK_VALUE
                 pnl = gross - commission - (slippage * qty * C.MGC_TICK_VALUE)
-                pnl = max(0, pnl)  # slippage can't turn a TP into a loss
+                pnl = max(0, pnl)
                 win_streak += 1
                 last_was_loss = False
                 wins += 1
             else:
-                # Loss outcome:
-                # 55% full SL, 30% breakeven scratch (BE move at 1.5R saves more), 15% stale/session
                 loss_roll = rng.random()
                 if loss_roll < 0.55:
-                    # Full SL
                     r_lost = 1.0
                     exit_type = "SL"
                 elif loss_roll < 0.85:
-                    # Breakeven scratch (moved SL to entry, got stopped at BE)
-                    r_lost = rng.uniform(-0.1, 0.15)  # near breakeven
+                    r_lost = rng.uniform(-0.1, 0.15)
                     exit_type = "BE_SL"
                 else:
-                    # Stale/session exit at small loss
                     r_lost = rng.uniform(0.2, 0.7)
                     exit_type = "STALE"
 
@@ -348,8 +354,7 @@ def simulate_run(seed: int) -> RunResult:
                 win_streak = 0
                 last_was_loss = True
 
-            # Hold time (all trades held >6s for scalp rule compliance)
-            hold = rng.uniform(8, 1200)  # 8s to 20min
+            hold = rng.uniform(8, 1200)
             if is_news:
                 hold = max(C.NEWS_MIN_HOLD_SEC + 1, hold)
 
@@ -359,12 +364,10 @@ def simulate_run(seed: int) -> RunResult:
             day_trades += 1
             total_trades += 1
 
-            # Intraday MLL breach check
             if equity < mll:
                 mll_breached = True
                 break
 
-            # Track drawdown
             if equity > peak_equity:
                 peak_equity = equity
             dd = peak_equity - equity
@@ -449,137 +452,269 @@ def simulate_run(seed: int) -> RunResult:
 # ── Parallel batch runner ──────────────────────────────────────────────────
 
 def run_batch(seeds: List[int]) -> List[RunResult]:
+    """Run batch using module-level _SIM_PARAMS (set before pool.submit)."""
     return [simulate_run(s) for s in seeds]
 
 
-def run_backtest(n_runs: int = 25000, base_seed: int = 42, workers: int = 8) -> None:
-    print(f"{'='*70}")
-    print(f"LucidFlex 50K Monte Carlo Backtest — {n_runs:,} runs")
-    print(f"{'='*70}")
-    print(f"Workers: {workers} | Base seed: {base_seed}")
-    print()
-    print("Adversarial conditions:")
-    print(f"  Regimes: {len(REGIMES)} (including Crisis at {REGIMES[-1].base_wr*100:.0f}% WR)")
-    print(f"  Commission: ${COMMISSION_RT}/rt | Slippage: 0-{SLIPPAGE_MAX_TICKS} ticks")
-    print(f"  Requote rate: {REQUOTE_RATE*100:.0f}% | Partial fill: {PARTIAL_FILL_RATE*100:.0f}%")
-    print(f"  GARCH(1,1) vol | Correlated failures | 1H trend filter")
-    print(f"  ATR filter | Confluence scoring (min {C.MIN_CONFLUENCE_SCORE})")
-    print(f"  Breakeven at {C.BREAKEVEN_R}R | Trail at {C.TRAIL_START_R}R")
-    print()
+def _init_worker(params: Optional[Dict]) -> None:
+    """Initializer for pool workers — sets module-level params."""
+    global _SIM_PARAMS
+    _SIM_PARAMS = params
 
-    seeds = [base_seed + i for i in range(n_runs)]
-    chunk_size = max(1, n_runs // workers)
-    chunks = [seeds[i:i+chunk_size] for i in range(0, n_runs, chunk_size)]
 
-    start = time_mod.monotonic()
-    results: List[RunResult] = []
+def pct(data, p):
+    """Percentile helper."""
+    if not data:
+        return 0
+    s = sorted(data)
+    idx = int(len(s) * p / 100)
+    return s[min(idx, len(s) - 1)]
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(run_batch, chunk) for chunk in chunks]
-        for i, future in enumerate(futures):
-            batch = future.result()
-            results.extend(batch)
-            done = len(results)
-            elapsed = time_mod.monotonic() - start
-            rate = done / elapsed if elapsed > 0 else 0
-            sys.stdout.write(f"\r  Progress: {done:,}/{n_runs:,} ({rate:.0f} runs/s)")
-            sys.stdout.flush()
 
-    elapsed = time_mod.monotonic() - start
-    print(f"\n  Completed in {elapsed:.1f}s ({n_runs/elapsed:.0f} runs/s)\n")
-
-    # ── Analyze results ─────────────────────────────────────────────────
-
+def analyze_results(results: List[RunResult], n_runs: int, label: str = "") -> Dict:
+    """Analyze results and return a metrics dict. Optionally prints report."""
     passed = [r for r in results if r.passed]
     failed = [r for r in results if r.failed]
     timeout = [r for r in results if not r.passed and not r.failed]
     mll_breaches = [r for r in results if r.mll_breached]
 
-    pass_rate = len(passed) / n_runs * 100
     pnls = [r.total_pnl for r in results]
-    pass_pnls = [r.total_pnl for r in passed] if passed else [0]
     days_to_pass = [r.days for r in passed] if passed else [0]
     max_dds = [r.max_dd for r in results]
     wrs = [r.win_rate for r in results if r.total_trades > 0]
     consistencies = [r.consistency for r in passed if r.consistency <= 1] if passed else [0]
+    trades_per_run = [r.total_trades for r in results]
 
-    def pct(data, p):
-        if not data:
-            return 0
-        s = sorted(data)
-        idx = int(len(s) * p / 100)
-        return s[min(idx, len(s) - 1)]
+    metrics = {
+        "label": label,
+        "n_runs": n_runs,
+        "pass_rate": len(passed) / n_runs * 100,
+        "fail_rate": len(failed) / n_runs * 100,
+        "timeout_rate": len(timeout) / n_runs * 100,
+        "mll_breaches": len(mll_breaches),
+        "pnl_p1": pct(pnls, 1),
+        "pnl_p5": pct(pnls, 5),
+        "pnl_p10": pct(pnls, 10),
+        "pnl_p25": pct(pnls, 25),
+        "pnl_median": pct(pnls, 50),
+        "pnl_p75": pct(pnls, 75),
+        "pnl_p90": pct(pnls, 90),
+        "pnl_p99": pct(pnls, 99),
+        "pnl_mean": statistics.mean(pnls),
+        "days_median": pct(days_to_pass, 50),
+        "days_p75": pct(days_to_pass, 75),
+        "days_p90": pct(days_to_pass, 90),
+        "days_p99": pct(days_to_pass, 99),
+        "days_max": max(days_to_pass) if days_to_pass else 0,
+        "dd_avg": statistics.mean(max_dds),
+        "dd_p95": pct(max_dds, 95),
+        "dd_p99": pct(max_dds, 99),
+        "wr_avg": statistics.mean(wrs) * 100 if wrs else 0,
+        "consistency_avg": statistics.mean(consistencies) * 100 if consistencies else 0,
+        "trades_avg": statistics.mean(trades_per_run),
+        "trades_median": pct(trades_per_run, 50),
+        "profit_factor": 0.0,
+        "sharpe": 0.0,
+        "calmar": 0.0,
+        "exit_reasons": dict(Counter(r.exit_reason for r in results)),
+    }
 
+    # Profit factor: gross wins / gross losses
+    daily_pnls = []
+    for r in results:
+        for d in r.daily_results:
+            daily_pnls.append(d.pnl)
+    gross_wins = sum(p for p in daily_pnls if p > 0)
+    gross_losses = abs(sum(p for p in daily_pnls if p < 0))
+    metrics["profit_factor"] = gross_wins / gross_losses if gross_losses > 0 else 999.0
+
+    # Sharpe ratio (daily PnL basis, annualized)
+    if len(daily_pnls) > 1:
+        mean_d = statistics.mean(daily_pnls)
+        std_d = statistics.stdev(daily_pnls)
+        metrics["sharpe"] = (mean_d / std_d * math.sqrt(252)) if std_d > 0 else 0.0
+
+    # Calmar ratio: mean total PnL / P99 MaxDD
+    if metrics["dd_p99"] > 0:
+        metrics["calmar"] = metrics["pnl_mean"] / metrics["dd_p99"]
+
+    return metrics
+
+
+def print_report(m: Dict) -> None:
+    """Print a formatted report from a metrics dict."""
+    label = m.get("label", "")
+    n = m["n_runs"]
     print(f"{'='*70}")
-    print(f"RESULTS SUMMARY")
-    print(f"{'='*70}")
+    if label:
+        print(f"  STRATEGY: {label}")
+        print(f"{'='*70}")
+    print(f"  Pass Rate:       {m['pass_rate']:.1f}%  ({int(m['pass_rate']*n/100):,}/{n:,})")
+    print(f"  Fail Rate:       {m['fail_rate']:.1f}%")
+    print(f"  Timeout ({MAX_EVAL_DAYS}d):  {m['timeout_rate']:.1f}%")
+    print(f"  MLL Breaches:    {m['mll_breaches']}")
     print()
-    print(f"  Pass Rate:       {pass_rate:.1f}%  ({len(passed):,}/{n_runs:,})")
-    print(f"  Fail Rate:       {len(failed)/n_runs*100:.1f}%  ({len(failed):,})")
-    print(f"  Timeout ({MAX_EVAL_DAYS}d):  {len(timeout)/n_runs*100:.1f}%  ({len(timeout):,})")
-    print(f"  MLL Breaches:    {len(mll_breaches):,}")
+    print(f"  ── PnL Distribution ────────────────────────────────")
+    for p_name in ["p1","p5","p10","p25","median","p75","p90","p99"]:
+        k = f"pnl_{p_name}"
+        lbl = f"P{p_name[1:]}" if p_name != "median" else "Median"
+        print(f"  {lbl:18s} ${m[k]:,.2f}")
+    print(f"  {'Mean':18s} ${m['pnl_mean']:,.2f}")
     print()
-
-    print(f"  ── PnL Distribution (all runs) ─────────────────────")
-    print(f"  P1:              ${pct(pnls, 1):,.2f}")
-    print(f"  P5:              ${pct(pnls, 5):,.2f}")
-    print(f"  P10:             ${pct(pnls, 10):,.2f}")
-    print(f"  P25:             ${pct(pnls, 25):,.2f}")
-    print(f"  Median (P50):    ${pct(pnls, 50):,.2f}")
-    print(f"  P75:             ${pct(pnls, 75):,.2f}")
-    print(f"  P90:             ${pct(pnls, 90):,.2f}")
-    print(f"  P99:             ${pct(pnls, 99):,.2f}")
-    print(f"  Mean:            ${statistics.mean(pnls):,.2f}")
+    print(f"  ── Speed ───────────────────────────────────────────")
+    print(f"  Median Days:     {m['days_median']}")
+    print(f"  P90 Days:        {m['days_p90']}")
+    print(f"  P99 Days:        {m['days_p99']}")
+    print(f"  Max Days:        {m['days_max']}")
     print()
-
-    print(f"  ── Days to Pass (passed runs only) ─────────────────")
-    if passed:
-        print(f"  Median:          {pct(days_to_pass, 50)}")
-        print(f"  P75:             {pct(days_to_pass, 75)}")
-        print(f"  P90:             {pct(days_to_pass, 90)}")
-        print(f"  P99:             {pct(days_to_pass, 99)}")
-        print(f"  Max:             {max(days_to_pass)}")
+    print(f"  ── Risk & Efficiency ───────────────────────────────")
+    print(f"  Avg MaxDD:       ${m['dd_avg']:,.2f}")
+    print(f"  P95 MaxDD:       ${m['dd_p95']:,.2f}")
+    print(f"  P99 MaxDD:       ${m['dd_p99']:,.2f}")
+    print(f"  Avg Win Rate:    {m['wr_avg']:.1f}%")
+    print(f"  Avg Consistency: {m['consistency_avg']:.1f}%")
+    print(f"  Avg Trades/Run:  {m['trades_avg']:.1f}")
+    print(f"  Profit Factor:   {m['profit_factor']:.2f}")
+    print(f"  Sharpe (ann.):   {m['sharpe']:.2f}")
+    print(f"  Calmar Ratio:    {m['calmar']:.2f}")
     print()
-
-    print(f"  ── Risk Metrics ────────────────────────────────────")
-    print(f"  Avg MaxDD:       ${statistics.mean(max_dds):,.2f}")
-    print(f"  P95 MaxDD:       ${pct(max_dds, 95):,.2f}")
-    print(f"  P99 MaxDD:       ${pct(max_dds, 99):,.2f}")
-    print(f"  Avg Win Rate:    {statistics.mean(wrs)*100:.1f}%")
-    if consistencies:
-        print(f"  Avg Consistency: {statistics.mean(consistencies)*100:.1f}%")
-    print(f"  Avg Trades/Run:  {statistics.mean([r.total_trades for r in results]):.1f}")
-    print()
-
-    # Regime breakdown for failures
-    if failed:
-        fail_regimes = Counter()
-        for r in failed:
-            for d in r.daily_results:
-                if d.pnl < -300:
-                    fail_regimes[d.regime] += 1
-        print(f"  ── Regime Breakdown (bad days in failed runs) ──────")
-        for regime, count in fail_regimes.most_common(5):
-            print(f"  {regime:20s}: {count:,} bad days")
-        print()
-
-    # Exit reason breakdown
-    exit_reasons = Counter(r.exit_reason for r in results)
     print(f"  ── Exit Reasons ────────────────────────────────────")
-    for reason, count in exit_reasons.most_common():
-        print(f"  {reason:25s}: {count:,} ({count/n_runs*100:.1f}%)")
-    print()
+    for reason, count in sorted(m["exit_reasons"].items(), key=lambda x: -x[1]):
+        print(f"  {reason:25s}: {count:,} ({count/n*100:.1f}%)")
+    print(f"{'='*70}")
 
-    print(f"{'='*70}")
-    if pass_rate >= 99.0:
-        print(f"  VERDICT: EXCELLENT — {pass_rate:.1f}% pass rate with {len(mll_breaches)} MLL breaches")
-    elif pass_rate >= 95.0:
-        print(f"  VERDICT: STRONG — {pass_rate:.1f}% pass rate")
-    elif pass_rate >= 90.0:
-        print(f"  VERDICT: GOOD — {pass_rate:.1f}% pass rate")
-    else:
-        print(f"  VERDICT: NEEDS OPTIMIZATION — {pass_rate:.1f}% pass rate")
-    print(f"{'='*70}")
+
+def run_backtest(
+    n_runs: int = 25000,
+    base_seed: int = 42,
+    workers: int = 8,
+    params: Optional[Dict] = None,
+    label: str = "",
+    quiet: bool = False,
+) -> Dict:
+    """Run backtest and return metrics dict."""
+    if not quiet:
+        tag = f" [{label}]" if label else ""
+        print(f"\nLucidFlex 50K Monte Carlo Backtest{tag} — {n_runs:,} runs, {workers} workers")
+
+    seeds = [base_seed + i for i in range(n_runs)]
+    chunk_size = max(1, n_runs // workers)
+    chunks = [seeds[i:i+chunk_size] for i in range(0, n_runs, chunk_size)]
+
+    # Set module-level params so workers can see them
+    global _SIM_PARAMS
+    _SIM_PARAMS = params
+
+    start = time_mod.monotonic()
+    results: List[RunResult] = []
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(params,),
+    ) as pool:
+        futures = [pool.submit(run_batch, chunk) for chunk in chunks]
+        for future in futures:
+            results.extend(future.result())
+            if not quiet:
+                done = len(results)
+                elapsed = time_mod.monotonic() - start
+                rate = done / elapsed if elapsed > 0 else 0
+                sys.stdout.write(f"\r  Progress: {done:,}/{n_runs:,} ({rate:.0f} runs/s)")
+                sys.stdout.flush()
+
+    elapsed = time_mod.monotonic() - start
+    if not quiet:
+        print(f"\n  Completed in {elapsed:.1f}s ({n_runs/elapsed:.0f} runs/s)")
+
+    metrics = analyze_results(results, n_runs, label=label)
+    if not quiet:
+        print_report(metrics)
+    return metrics
+
+
+def compare_strategies(
+    strategies: Dict[str, Dict],
+    n_runs: int = 10000,
+    base_seed: int = 42,
+    workers: int = 4,
+) -> None:
+    """Run multiple strategies head-to-head and print comparison table."""
+    all_metrics = {}
+    for name, params in strategies.items():
+        m = run_backtest(n_runs=n_runs, base_seed=base_seed, workers=workers,
+                         params=params, label=name, quiet=True)
+        all_metrics[name] = m
+        print(f"  {name:20s}: pass={m['pass_rate']:.1f}%  fail={m['fail_rate']:.1f}%  "
+              f"median_days={m['days_median']}  wr={m['wr_avg']:.1f}%  "
+              f"pf={m['profit_factor']:.2f}  sharpe={m['sharpe']:.2f}")
+
+    # Print comparison table
+    names = list(all_metrics.keys())
+    print(f"\n{'='*90}")
+    print(f"  HEAD-TO-HEAD STRATEGY COMPARISON ({n_runs:,} runs each, seed={base_seed})")
+    print(f"{'='*90}")
+
+    rows = [
+        ("Pass Rate %",        "pass_rate",       "{:.1f}"),
+        ("Fail Rate %",        "fail_rate",       "{:.1f}"),
+        ("Timeout %",          "timeout_rate",    "{:.1f}"),
+        ("MLL Breaches",       "mll_breaches",    "{}"),
+        ("Median PnL $",       "pnl_median",      "{:,.0f}"),
+        ("Mean PnL $",         "pnl_mean",        "{:,.0f}"),
+        ("P1 PnL $",           "pnl_p1",          "{:,.0f}"),
+        ("Median Days",        "days_median",     "{}"),
+        ("P90 Days",           "days_p90",        "{}"),
+        ("Avg MaxDD $",        "dd_avg",          "{:,.0f}"),
+        ("P99 MaxDD $",        "dd_p99",          "{:,.0f}"),
+        ("Avg Win Rate %",     "wr_avg",          "{:.1f}"),
+        ("Avg Consistency %",  "consistency_avg", "{:.1f}"),
+        ("Avg Trades/Run",     "trades_avg",      "{:.1f}"),
+        ("Profit Factor",      "profit_factor",   "{:.2f}"),
+        ("Sharpe (ann.)",      "sharpe",          "{:.2f}"),
+        ("Calmar Ratio",       "calmar",          "{:.2f}"),
+    ]
+
+    # Header
+    header = f"  {'Metric':24s}"
+    for name in names:
+        header += f"  {name:>14s}"
+    print(header)
+    print(f"  {'-'*24}" + f"  {'-'*14}" * len(names))
+
+    for row_label, key, fmt in rows:
+        line = f"  {row_label:24s}"
+        vals = [all_metrics[n][key] for n in names]
+        best_idx = None
+        if key in ("pass_rate", "pnl_median", "pnl_mean", "pnl_p1", "wr_avg",
+                    "profit_factor", "sharpe", "calmar"):
+            best_idx = vals.index(max(vals))
+        elif key in ("fail_rate", "timeout_rate", "mll_breaches", "days_median",
+                      "days_p90", "dd_avg", "dd_p99"):
+            best_idx = vals.index(min(vals))
+        for i, v in enumerate(vals):
+            s = fmt.format(v)
+            marker = " *" if i == best_idx else "  "
+            line += f"  {s:>12s}{marker}"
+        print(line)
+
+    print(f"\n  * = best in category")
+    print(f"{'='*90}")
+
+    # Overall winner
+    scores = {n: 0 for n in names}
+    for row_label, key, fmt in rows:
+        vals = {n: all_metrics[n][key] for n in names}
+        if key in ("pass_rate", "pnl_median", "pnl_mean", "pnl_p1", "wr_avg",
+                    "profit_factor", "sharpe", "calmar"):
+            winner = max(vals, key=vals.get)
+        else:
+            winner = min(vals, key=vals.get)
+        scores[winner] += 1
+    best = max(scores, key=scores.get)
+    print(f"\n  OVERALL WINNER: {best} ({scores[best]}/{len(rows)} categories)")
+    for n in names:
+        print(f"    {n}: {scores[n]} wins")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -589,9 +724,66 @@ def main():
     parser.add_argument("--runs", type=int, default=25000, help="Number of simulation runs")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--workers", type=int, default=8, help="Parallel workers")
+    parser.add_argument("--strategy", type=str, default=None,
+                        help="Strategy profile name (default, high_volume, conservative, aggressive)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Compare all strategies head-to-head")
     args = parser.parse_args()
 
-    run_backtest(n_runs=args.runs, base_seed=args.seed, workers=args.workers)
+    if args.compare:
+        from lucidflex.strategy import PROFILES
+        strat_params = {}
+        for name, profile in PROFILES.items():
+            strat_params[name] = {
+                "risk_pct": profile.risk_pct,
+                "min_rr": profile.min_rr,
+                "daily_cap": profile.daily_cap,
+                "soft_loss": profile.soft_loss,
+                "max_trades_per_day": profile.max_trades_per_day,
+                "breakeven_r": profile.breakeven_r,
+                "trail_start_r": profile.trail_start_r,
+                "trail_distance_r": profile.trail_distance_r,
+                "min_confluence_score": profile.min_confluence_score,
+                "atr_min_ticks": profile.atr_min_ticks,
+                "atr_adaptive_tp_mult": profile.atr_adaptive_tp_mult,
+                "atr_adaptive_tp_max_rr": profile.atr_adaptive_tp_max_rr,
+                "win_streak_boost_after": profile.win_streak_boost_after,
+                "win_streak_boost_mult": profile.win_streak_boost_mult,
+                "news_boost": profile.news_boost,
+                "sl_tick_min": profile.sl_tick_min,
+                "sl_tick_max": profile.sl_tick_max,
+            }
+        compare_strategies(strat_params, n_runs=args.runs, base_seed=args.seed, workers=args.workers)
+        return
+
+    params = None
+    label = "default"
+    if args.strategy:
+        from lucidflex.strategy import load_profile
+        profile = load_profile(args.strategy)
+        label = profile.name
+        params = {
+            "risk_pct": profile.risk_pct,
+            "min_rr": profile.min_rr,
+            "daily_cap": profile.daily_cap,
+            "soft_loss": profile.soft_loss,
+            "max_trades_per_day": profile.max_trades_per_day,
+            "breakeven_r": profile.breakeven_r,
+            "trail_start_r": profile.trail_start_r,
+            "trail_distance_r": profile.trail_distance_r,
+            "min_confluence_score": profile.min_confluence_score,
+            "atr_min_ticks": profile.atr_min_ticks,
+            "atr_adaptive_tp_mult": profile.atr_adaptive_tp_mult,
+            "atr_adaptive_tp_max_rr": profile.atr_adaptive_tp_max_rr,
+            "win_streak_boost_after": profile.win_streak_boost_after,
+            "win_streak_boost_mult": profile.win_streak_boost_mult,
+            "news_boost": profile.news_boost,
+            "sl_tick_min": profile.sl_tick_min,
+            "sl_tick_max": profile.sl_tick_max,
+        }
+
+    run_backtest(n_runs=args.runs, base_seed=args.seed, workers=args.workers,
+                 params=params, label=label)
 
 
 if __name__ == "__main__":

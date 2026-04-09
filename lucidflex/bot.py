@@ -346,6 +346,38 @@ class TradingBot:
         log.info("Bot stopped. Final equity: $%.2f", self.state.equity)
 
 
+# ── Strategy profile loader ────────────────────────────────────────────────
+
+def apply_strategy_profile(profile_name: str) -> None:
+    """Override config.py values with a strategy profile for autonomous switching."""
+    from lucidflex.strategy import load_profile
+    profile = load_profile(profile_name)
+
+    C.RISK_PCT = profile.risk_pct
+    C.MIN_RR = profile.min_rr
+    C.DAILY_CAP = profile.daily_cap
+    C.SOFT_LOSS = profile.soft_loss
+    C.MAX_TRADES_PER_DAY = profile.max_trades_per_day
+    C.BREAKEVEN_R = profile.breakeven_r
+    C.TRAIL_START_R = profile.trail_start_r
+    C.TRAIL_DISTANCE_R = profile.trail_distance_r
+    C.STALE_TRADE_MINUTES = profile.stale_trade_minutes
+    C.STALE_TRADE_MIN_R = profile.stale_trade_min_r
+    C.SESSION_END_MIN_R = profile.session_end_min_r
+    C.MIN_CONFLUENCE_SCORE = profile.min_confluence_score
+    C.ATR_MIN_TICKS = profile.atr_min_ticks
+    C.ATR_ADAPTIVE_TP_MULT = profile.atr_adaptive_tp_mult
+    C.ATR_ADAPTIVE_TP_MAX_RR = profile.atr_adaptive_tp_max_rr
+    C.WIN_STREAK_BOOST_AFTER = profile.win_streak_boost_after
+    C.WIN_STREAK_BOOST_MULT = profile.win_streak_boost_mult
+    C.NEWS_BOOST = profile.news_boost
+    C.POST_LOSS_COOLDOWN_SEC = profile.post_loss_cooldown_sec
+    C.SL_TICK_MIN = profile.sl_tick_min
+    C.SL_TICK_MAX = profile.sl_tick_max
+
+    log.info("Loaded strategy profile: %s — %s", profile.name, profile.description)
+
+
 # ── CLI entry point ─────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -357,6 +389,8 @@ def main() -> None:
     parser.add_argument("--news", nargs="*", default=[], help="News event times (ISO format)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--reset", action="store_true", help="Reset evaluation state")
+    parser.add_argument("--strategy", type=str, default=None,
+                        help="Strategy profile (default, high_volume, conservative, aggressive)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -368,6 +402,10 @@ def main() -> None:
             logging.FileHandler("lucidflex.log", mode="a"),
         ],
     )
+
+    # Load strategy profile if specified
+    if args.strategy:
+        apply_strategy_profile(args.strategy)
 
     if args.reset and STATE_FILE.exists():
         STATE_FILE.unlink()
