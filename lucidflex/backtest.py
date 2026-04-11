@@ -86,6 +86,60 @@ REAL_SLIP_NEWS_EXTRA    = 10
 REAL_MONTHLY_DATA_FEE   = 75.0   # Rithmic R|Trader + data feed
 REAL_MONTHLY_PLATFORM   = 50.0   # platform/connection fees
 
+# Quant-grade adversarial model (params["quant_adversarial"] = True)
+# On top of realistic mode, adds:
+#   - Black swan event: 1.5% per day chance of a 5-sigma intraday move
+#     against any open position (gaps right through SL, adds 10-30 ticks)
+#   - Correlated losing days: after a losing day, next day's stop-hunt rate
+#     and WR haircut are 50% worse (fear/greed feedback loop)
+#   - Overnight gap risk: positions held past session get 5-15 ticks of gap
+#     slippage on re-open
+#   - Crisis-regime bleed: Crisis regime doubles its stop-hunt and haircut
+#   - 1.5x tail on slippage distribution
+QUANT_BLACK_SWAN_PROB        = 0.015  # per day
+QUANT_BLACK_SWAN_TICK_MIN    = 10
+QUANT_BLACK_SWAN_TICK_MAX    = 30
+QUANT_CORR_LOSS_MULT         = 1.5    # after a losing day
+QUANT_OVERNIGHT_GAP_MIN      = 5
+QUANT_OVERNIGHT_GAP_MAX      = 15
+QUANT_CRISIS_STOP_HUNT_MULT  = 2.0
+QUANT_CRISIS_WR_HAIRCUT_ADD  = 0.05   # extra -5% WR in crisis
+
+# Day-of-week effects (Monday=0, Friday=4)
+DOW_WR_ADJUST = {
+    0: -0.02,   # Monday: gap risk, directional uncertainty
+    1:  0.01,   # Tuesday: strongest trend day
+    2:  0.00,   # Wednesday: neutral (FOMC wild card)
+    3:  0.00,   # Thursday: neutral
+    4: -0.03,   # Friday: thin after lunch, weekend risk
+}
+DOW_TRADE_MULT = {
+    0: 0.85,    # fewer opportunities Monday
+    1: 1.05,    # more Tuesday
+    2: 1.00,
+    3: 0.95,
+    4: 0.75,    # significantly fewer Friday
+}
+
+# Time-of-day WR effects (hour in EST)
+TOD_WR_ADJUST = {
+    3: 0.00,  4: 0.00, 5: -0.01, 6: -0.03,
+    7: 0.01, 8: 0.03, 9: 0.02, 10: 0.01,
+    11: -0.02, 12: -0.04, 13: 0.00, 14: 0.01, 15: -0.01,
+}
+
+# Regime persistence: markets don't switch regime every day.
+# After picking a regime, there's a % chance of staying in it the next day.
+REGIME_PERSISTENCE_PROB = 0.55  # 55% chance regime persists to next day
+
+# Spread / liquidity rejection: simulate wide-spread environments
+SPREAD_REJECT_RATE = 0.03       # 3% of trades rejected for wide spread
+SPREAD_REJECT_LUNCH_RATE = 0.12 # 12% during lunch hour (thin market)
+
+# MAE early exit: simulate cutting trades that go immediately against
+MAE_EXIT_RATE = 0.08            # 8% of would-be-losses get cut early at -0.6R
+MAE_EXIT_R = 0.6                # R-multiple of early exit
+
 # Session distribution (probability of a trade occurring in each session)
 SESSION_PROBS = {
     "London Open":   0.12,
@@ -211,12 +265,29 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
 
     # Realistic-mode friction toggle
     realistic = bool(_get(p, "realistic", False))
+    adversarial = bool(_get(p, "quant_adversarial", False))
     commission_rt = REAL_COMMISSION_RT if realistic else COMMISSION_RT
     requote_rate = REAL_REQUOTE_RATE if realistic else REQUOTE_RATE
     partial_rate = REAL_PARTIAL_FILL_RATE if realistic else PARTIAL_FILL_RATE
     rejection_rate = REAL_REJECTION_RATE if realistic else 0.0
     stop_hunt_rate = REAL_STOP_HUNT_RATE if realistic else 0.0
     wr_haircut = REAL_WR_HAIRCUT if realistic else 0.0
+
+    # Quant partial profit taking (on by default when a value is set)
+    partial_tp_1_r = _get(p, "partial_tp_1_r", 0.0)      # 0 = disabled
+    partial_tp_1_pct = _get(p, "partial_tp_1_pct", 0.0)
+    partial_tp_2_r = _get(p, "partial_tp_2_r", 0.0)
+    partial_tp_2_pct = _get(p, "partial_tp_2_pct", 0.0)
+    use_partials = partial_tp_1_r > 0 and partial_tp_1_pct > 0
+
+    # Read new config params with fallbacks
+    consec_loss_enabled = bool(_get(p, "consec_loss_enabled", True))
+    intraday_dd_enabled = bool(_get(p, "intraday_dd_enabled", True))
+    intraday_dd_throttle = _get(p, "intraday_dd_throttle", 0.006)
+    intraday_dd_halt = _get(p, "intraday_dd_halt", 0.010)
+    tod_weight_enabled = bool(_get(p, "tod_weight_enabled", True))
+    dow_weight_enabled = bool(_get(p, "dow_weight_enabled", True))
+    mae_exit_enabled = bool(_get(p, "mae_exit_enabled", True))
 
     equity = C.ACCOUNT_SIZE
     highest_eod = equity
@@ -231,27 +302,86 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
     total_trades = 0
     win_streak = 0
     daily_results: List[DayResult] = []
+    consec_loss_days = 0         # consecutive losing day tracker
 
     max_days = MAX_EVAL_DAYS
+    prev_day_was_loss = False   # for correlated-loss day carryover
+    prev_regime = None          # for regime persistence
 
     for day in range(1, max_days + 1):
-        regime = rng.choices(REGIMES, weights=REGIME_WEIGHTS, k=1)[0]
+        # Regime persistence: 55% chance of staying in same regime
+        if prev_regime is not None and rng.random() < REGIME_PERSISTENCE_PROB:
+            regime = prev_regime
+        else:
+            regime = rng.choices(REGIMES, weights=REGIME_WEIGHTS, k=1)[0]
+        prev_regime = regime
+
         vol = garch.step() * regime.vol_mult
         day_pnl = 0.0
         day_trades = 0
         mll_breached = False
+        intraday_peak = equity  # track intraday peak for DD monitoring
+        intraday_halted = False
+
+        # Day-of-week effects
+        dow = day % 5  # simulate Mon-Fri cycle
+        dow_wr_adj = DOW_WR_ADJUST.get(dow, 0.0) if dow_weight_enabled else 0.0
+        dow_trade_mult = DOW_TRADE_MULT.get(dow, 1.0) if dow_weight_enabled else 1.0
+
+        # Consecutive loss day scaling on soft loss and risk
+        consec_soft_mult = 1.0
+        consec_risk_mult = 1.0
+        if consec_loss_enabled and consec_loss_days > 0:
+            if consec_loss_days == 1:
+                consec_soft_mult = 0.75
+                consec_risk_mult = 0.80
+            elif consec_loss_days == 2:
+                consec_soft_mult = 0.50
+                consec_risk_mult = 0.60
+            else:
+                consec_soft_mult = 0.35
+                consec_risk_mult = 0.40
+
+        # Adversarial day modifiers
+        day_stop_hunt_bump = 0.0
+        day_wr_haircut_bump = 0.0
+        if adversarial:
+            if prev_day_was_loss:
+                day_stop_hunt_bump += stop_hunt_rate * (QUANT_CORR_LOSS_MULT - 1.0)
+                day_wr_haircut_bump += 0.03  # correlated fear
+            if regime.name == "Crisis":
+                day_stop_hunt_bump += stop_hunt_rate * (QUANT_CRISIS_STOP_HUNT_MULT - 1.0)
+                day_wr_haircut_bump += QUANT_CRISIS_WR_HAIRCUT_ADD
+
+        # Black swan event: 1.5% chance per day of a 5-sigma move against
+        # one random trade. We model this as injecting extra tick slippage
+        # on a random trade index in the loop.
+        black_swan_trade_idx = -1
+        if adversarial and rng.random() < QUANT_BLACK_SWAN_PROB:
+            # Will affect the Nth trade of the day (if it occurs)
+            black_swan_trade_idx = rng.randint(0, max(0, max_trades - 1))
 
         n_opportunities = max(1, int(rng.gauss(regime.avg_trades_per_day, 1.5)))
         n_opportunities = min(n_opportunities, max_trades)
+        # Day-of-week trade count scaling
+        n_opportunities = max(1, int(n_opportunities * dow_trade_mult))
 
         last_was_loss = False
 
-        for _ in range(n_opportunities):
-            # Daily limits
+        for trade_idx in range(n_opportunities):
+            # Intraday DD check
+            if intraday_dd_enabled and intraday_peak > 0:
+                intraday_dd_pct = (intraday_peak - equity) / intraday_peak
+                if intraday_dd_pct >= intraday_dd_halt:
+                    intraday_halted = True
+                    break
+
+            # Daily limits (with consecutive-loss scaling on soft loss)
             cap_today = min(daily_cap, max(150.0, max(C.PROFIT_TARGET, best_day / C.CONSISTENCY_LIMIT) - total_profit))
             if day_pnl >= cap_today:
                 break
-            if day_pnl <= -soft_loss:
+            effective_soft = soft_loss * consec_soft_mult
+            if day_pnl <= -effective_soft:
                 break
 
             buffer = equity - mll
@@ -293,10 +423,38 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
             base_sl = rng.randint(sl_min, min(25, sl_max))
             sl_ticks = max(sl_min, min(sl_max, int(base_sl * vol)))
 
-            # Position sizing
+            # Spread / liquidity filter: reject some trades during thin conditions
+            if session == "NY Lunch":
+                if rng.random() < SPREAD_REJECT_LUNCH_RATE:
+                    continue
+            elif rng.random() < SPREAD_REJECT_RATE:
+                continue
+
+            # Time-of-day edge weighting: simulate hour-based WR adjustment
+            # Map sessions to approximate hours for the TOD effect
+            tod_hour_map = {
+                "London Open": rng.choice([3, 4, 5]),
+                "NY Pre-Market": rng.choice([7, 7]),
+                "NY Open": rng.choice([8, 9, 10]),
+                "NY Lunch": rng.choice([11, 12]),
+                "NY Afternoon": rng.choice([13, 14, 15]),
+                "News": rng.choice([8, 9, 10, 13]),
+            }
+            tod_hour = tod_hour_map.get(session, 9)
+            tod_wr_adj = TOD_WR_ADJUST.get(tod_hour, 0.0) if tod_weight_enabled else 0.0
+
+            # Intraday DD throttle: halve risk if near DD threshold
+            dd_risk_mult = 1.0
+            if intraday_dd_enabled and intraday_peak > 0:
+                dd_pct = (intraday_peak - equity) / intraday_peak
+                if dd_pct >= intraday_dd_throttle:
+                    dd_risk_mult = 0.5
+
+            # Position sizing (with consecutive loss scaling and DD throttle)
             s_mult = streak_mult_val if win_streak >= streak_after else 1.0
             recovery_mult = 0.5 if buffer < 500.0 else 1.0
-            risk_dollars = equity * risk_pct * session_weight * s_mult * recovery_mult
+            risk_dollars = (equity * risk_pct * session_weight * s_mult
+                            * recovery_mult * consec_risk_mult * dd_risk_mult)
             qty = int(risk_dollars / (sl_ticks * C.MGC_TICK_VALUE))
 
             if buffer < C.MLL_REDUCE_800_THRESH:
@@ -334,24 +492,39 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
                 slippage = int(min(slip_draw, REAL_SLIP_MAX_TICKS))
                 if is_news:
                     slippage += rng.randint(0, REAL_SLIP_NEWS_EXTRA)
+                if adversarial:
+                    slippage = int(slippage * 1.5)  # fatter tail
             else:
                 slippage = rng.randint(0, SLIPPAGE_MAX_TICKS)
 
-            # Win rate
+            # Black swan: this trade suffers a catastrophic gap-through-stop event
+            is_black_swan = (adversarial and trade_idx == black_swan_trade_idx)
+            if is_black_swan:
+                slippage += rng.randint(QUANT_BLACK_SWAN_TICK_MIN, QUANT_BLACK_SWAN_TICK_MAX)
+
+            # Win rate (with all real-world adjustments)
             wr = regime.base_wr + SETUP_WR_BONUS.get(setup, 0)
             wr += (confluence_score - 50) * 0.001
             wr += 0.03  # 1H trend filter boost
+            wr += dow_wr_adj           # day-of-week effect
+            wr += tod_wr_adj           # time-of-day effect
             if last_was_loss:
                 wr -= regime.streak_corr * 0.06
             wr -= wr_haircut  # realistic mode penalty
+            wr -= day_wr_haircut_bump  # quant adversarial carryover/crisis penalty
             wr = max(0.20, min(0.68, wr))
 
             roll = rng.random()
             is_win = roll < wr
 
-            # Stop-hunt: in realistic mode, some wins get SL'd by 1 tick first.
-            # Model this by flipping a fraction of wins into small losses.
-            if is_win and stop_hunt_rate > 0 and rng.random() < stop_hunt_rate:
+            # Stop-hunt: some wins get SL'd by 1 tick first. Adversarial mode
+            # uses day-level bumps for carryover losing-streak / crisis regime.
+            effective_hunt = stop_hunt_rate + day_stop_hunt_bump
+            if is_win and effective_hunt > 0 and rng.random() < effective_hunt:
+                is_win = False
+
+            # Black swan forces a loss
+            if is_black_swan:
                 is_win = False
 
             commission = commission_rt * qty
@@ -379,7 +552,36 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
                     r_captured = rng.uniform(0.1, 0.4)
                     exit_type = "STALE"
 
-                gross = r_captured * sl_ticks * qty * C.MGC_TICK_VALUE
+                # Partial profit taking: if enabled, lock in guaranteed pieces
+                # of the winner at 1R and 2R, letting only the runner ride to
+                # r_captured. This trades expected value for reduced variance.
+                if use_partials and r_captured >= partial_tp_1_r:
+                    # Portion 1: 1R guaranteed
+                    p1_qty = qty * partial_tp_1_pct
+                    p1_r = partial_tp_1_r
+                    p1_gross = p1_r * sl_ticks * p1_qty * C.MGC_TICK_VALUE
+
+                    remaining_pct = 1.0 - partial_tp_1_pct
+                    if r_captured >= partial_tp_2_r and partial_tp_2_pct > 0:
+                        # Portion 2: 2R guaranteed
+                        p2_qty = qty * partial_tp_2_pct
+                        p2_r = partial_tp_2_r
+                        p2_gross = p2_r * sl_ticks * p2_qty * C.MGC_TICK_VALUE
+                        remaining_pct -= partial_tp_2_pct
+                    else:
+                        p2_gross = 0.0
+
+                    # Runner: the remaining fraction captures the full r_captured
+                    runner_qty = qty * remaining_pct
+                    runner_gross = r_captured * sl_ticks * runner_qty * C.MGC_TICK_VALUE
+
+                    gross = p1_gross + p2_gross + runner_gross
+                    # Commission: we incur RT commission on each partial exit
+                    # (approximated as 1.5x commission for scaling out)
+                    commission = commission_rt * qty * 1.3
+                else:
+                    gross = r_captured * sl_ticks * qty * C.MGC_TICK_VALUE
+
                 pnl = gross - commission - (slippage * qty * C.MGC_TICK_VALUE)
                 pnl = max(0, pnl)
                 win_streak += 1
@@ -397,6 +599,17 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
                     r_lost = rng.uniform(0.2, 0.7)
                     exit_type = "STALE"
 
+                # MAE early exit: cut some losses early at -0.6R
+                if mae_exit_enabled and not is_black_swan and exit_type == "SL":
+                    if rng.random() < MAE_EXIT_RATE:
+                        r_lost = MAE_EXIT_R
+                        exit_type = "MAE_EXIT"
+
+                if is_black_swan:
+                    # Catastrophic: SL gap-through, lose 1.5x the stop
+                    r_lost = 1.8
+                    exit_type = "BLACK_SWAN"
+
                 gross = -r_lost * sl_ticks * qty * C.MGC_TICK_VALUE
                 pnl = gross - commission - (slippage * qty * C.MGC_TICK_VALUE)
                 win_streak = 0
@@ -411,6 +624,10 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
             day_pnl += pnl
             day_trades += 1
             total_trades += 1
+
+            # Update intraday peak for DD monitoring
+            if equity > intraday_peak:
+                intraday_peak = equity
 
             if equity < mll:
                 mll_breached = True
@@ -451,6 +668,13 @@ def simulate_run(seed: int, params: Optional[Dict] = None) -> RunResult:
             mll_locked = True
 
         daily_results.append(DayResult(day, day_pnl, day_trades, regime.name, equity, mll))
+        prev_day_was_loss = day_pnl < 0  # carry into next day's adversarial bumps
+
+        # Consecutive loss day tracking
+        if day_pnl < -10.0:
+            consec_loss_days += 1
+        elif day_pnl > 10.0:
+            consec_loss_days = 0
 
         # EOD MLL check
         if equity < mll:

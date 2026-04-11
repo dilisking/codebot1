@@ -219,6 +219,80 @@ REALISTIC = StrategyProfile(
 )
 
 
+# ── Strategy: Survivor (maximum real-market survival) ─────────────────────
+# Designed from first principles for maximum live-market survival:
+#   - Ultra-small risk (0.4%) — any single trade can never hurt you
+#   - High RR (5.0) — only take trades where reward dwarfs friction
+#   - Tight daily limits — cap gains to preserve consistency rule
+#   - Aggressive breakeven (1.0R) — lock in free trades fast
+#   - Very strict confluence (55+) — only the highest-probability setups
+#   - High ATR floor (6 ticks) — never trade in dead markets
+#   - Long post-loss cooldown (20s) — prevent revenge trading
+#   - Conservative news boost (1.1x) — news slippage eats edge
+#   - Tight SL range (7-30) — prevent over-exposure on wide stops
+# Philosophy: The market is trying to kill you. Survive first. Profit follows.
+
+SURVIVOR = StrategyProfile(
+    name="survivor",
+    description="Maximum survival — ultra-small risk, strict filters, survive anything",
+    risk_pct=0.004,             # 0.4% risk — smallest possible per-trade exposure
+    min_rr=5.0,                 # only take asymmetric bets
+    daily_cap=400.0,            # lock in small gains, preserve consistency
+    soft_loss=350.0,            # tiny daily loss budget — stop early, trade tomorrow
+    max_trades_per_day=8,       # fewer trades = fewer chances to bleed
+    breakeven_r=1.0,            # move to breakeven fast — free trade ASAP
+    trail_start_r=2.5,          # trail from 2.5R
+    trail_distance_r=1.2,       # tight trail to lock profit
+    stale_trade_minutes=15,     # exit faster if trade isn't working
+    stale_trade_min_r=0.3,      # lower threshold for stale exit
+    session_end_min_r=1.5,      # keep if 1.5R+ at session end
+    min_confluence_score=55,    # only highest-quality setups
+    atr_min_ticks=6,            # never trade dead markets
+    atr_adaptive_tp_mult=1.2,   # modest TP extension in high vol
+    atr_adaptive_tp_max_rr=7.0, # cap adaptive TP
+    win_streak_boost_after=3,   # require 3 wins before any boost
+    win_streak_boost_mult=1.10, # tiny boost — don't get greedy
+    news_boost=1.1,             # almost no news boost — slippage kills
+    post_loss_cooldown_sec=20.0,# longest cooldown — prevent tilt
+    sl_tick_min=7,              # minimum SL gives room for noise
+    sl_tick_max=30,             # cap SL to limit max loss per trade
+)
+
+
+# ── Strategy: Adaptive (uses all new quant-grade features) ────────────────
+# Built to leverage every enhancement: regime-adaptive sizing, Kelly,
+# consecutive-loss scaling, intraday DD monitoring, MAE exits, partial TPs,
+# time-of-day weighting, and spread filtering.
+# This profile sets moderate base params and lets the adaptive systems
+# do the heavy lifting.
+
+ADAPTIVE = StrategyProfile(
+    name="adaptive",
+    description="Leverages all quant-grade adaptive systems — let the bot decide risk",
+    risk_pct=0.006,             # moderate base — Kelly/regime will adjust
+    min_rr=4.0,                 # moderate RR — more trade opportunities
+    daily_cap=500.0,
+    soft_loss=450.0,            # moderate — consecutive-loss scaling tightens further
+    max_trades_per_day=10,
+    breakeven_r=1.2,
+    trail_start_r=2.0,
+    trail_distance_r=1.3,
+    stale_trade_minutes=18,
+    stale_trade_min_r=0.4,
+    session_end_min_r=1.5,
+    min_confluence_score=45,    # moderate gate — setup tracker disables bad ones
+    atr_min_ticks=5,
+    atr_adaptive_tp_mult=1.3,
+    atr_adaptive_tp_max_rr=6.5,
+    win_streak_boost_after=2,
+    win_streak_boost_mult=1.15,
+    news_boost=1.2,
+    post_loss_cooldown_sec=15.0,
+    sl_tick_min=6,
+    sl_tick_max=35,
+)
+
+
 # ── Registry ───────────────────────────────────────────────────────────────
 
 PROFILES: Dict[str, StrategyProfile] = {
@@ -228,6 +302,8 @@ PROFILES: Dict[str, StrategyProfile] = {
     "aggressive": AGGRESSIVE,
     "optimizer_best": OPTIMIZER_BEST,
     "realistic": REALISTIC,
+    "survivor": SURVIVOR,
+    "adaptive": ADAPTIVE,
 }
 
 

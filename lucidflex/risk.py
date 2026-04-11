@@ -33,6 +33,11 @@ class EvalState:
     day_trades: int = 0
     challenge_passed: bool = False
     challenge_failed: bool = False
+    # Consecutive losing day tracker
+    consec_loss_days: int = 0
+    # Intraday peak equity for DD monitoring
+    intraday_peak: float = C.ACCOUNT_SIZE
+    intraday_dd_halted: bool = False
 
     @property
     def mll_buffer(self) -> float:
@@ -46,6 +51,28 @@ class EvalState:
     def daily_cap_today(self) -> float:
         remaining = self.required_total - self.total_profit
         return min(C.DAILY_CAP, max(150.0, remaining))
+
+    @property
+    def consec_loss_risk_mult(self) -> float:
+        """Risk multiplier based on consecutive losing days."""
+        if not C.CONSEC_LOSS_SCALE_ENABLED or self.consec_loss_days == 0:
+            return 1.0
+        if self.consec_loss_days == 1:
+            return C.CONSEC_LOSS_1_RISK_MULT
+        if self.consec_loss_days == 2:
+            return C.CONSEC_LOSS_2_RISK_MULT
+        return C.CONSEC_LOSS_3_RISK_MULT
+
+    @property
+    def consec_loss_soft_mult(self) -> float:
+        """Soft loss multiplier based on consecutive losing days."""
+        if not C.CONSEC_LOSS_SCALE_ENABLED or self.consec_loss_days == 0:
+            return 1.0
+        if self.consec_loss_days == 1:
+            return C.CONSEC_LOSS_1_SOFT_MULT
+        if self.consec_loss_days == 2:
+            return C.CONSEC_LOSS_2_SOFT_MULT
+        return C.CONSEC_LOSS_3_SOFT_MULT
 
     def passed(self) -> bool:
         if self.total_profit < self.required_total:
@@ -100,7 +127,43 @@ class RiskManager:
             return C.MLL_REDUCE_1200_CAP
         return C.MAX_MGC_CONTRACTS
 
-    # ── Position sizing (session-weighted) ──────────────────────────────
+    # ── Regime-adaptive risk multiplier ───────────────────────────────
+
+    def regime_multiplier(self, atr_ratio: float = 1.0, trend_aligned: bool = False) -> float:
+        """Dynamic risk multiplier based on current market regime signals."""
+        if not C.REGIME_ADAPT_ENABLED:
+            return 1.0
+        mult = 1.0
+        if atr_ratio > C.REGIME_VOL_HIGH_THRESH:
+            mult *= C.REGIME_VOL_HIGH_MULT
+        elif atr_ratio < C.REGIME_VOL_LOW_THRESH:
+            mult *= C.REGIME_VOL_LOW_MULT
+        if trend_aligned:
+            mult *= C.REGIME_TREND_BONUS
+        return mult
+
+    # ── Intraday drawdown check ────────────────────────────────────────
+
+    def check_intraday_dd(self) -> float:
+        """Returns intraday DD multiplier (1.0 = normal, 0.5 = throttled, 0.0 = halted)."""
+        if not C.INTRADAY_DD_ENABLED:
+            return 1.0
+        if self.state.intraday_dd_halted:
+            return 0.0
+        dd_pct = (self.state.intraday_peak - self.state.equity) / self.state.intraday_peak
+        if dd_pct >= C.INTRADAY_DD_HALT_PCT:
+            self.state.intraday_dd_halted = True
+            log.warning(
+                "INTRADAY DD HALT: dd=%.2f%% of equity — stopping for today",
+                dd_pct * 100,
+            )
+            return 0.0
+        if dd_pct >= C.INTRADAY_DD_THROTTLE_PCT:
+            log.info("INTRADAY DD THROTTLE: dd=%.2f%% — halving risk", dd_pct * 100)
+            return 0.5
+        return 1.0
+
+    # ── Position sizing (session-weighted + regime-adaptive) ──────────
 
     def size_position(
         self,
@@ -108,8 +171,16 @@ class RiskManager:
         is_news: bool = False,
         session_weight: float = 1.0,
         win_streak: int = 0,
+        atr_ratio: float = 1.0,
+        trend_aligned: bool = False,
+        tod_weight: float = 1.0,
     ) -> int:
         sl_ticks = max(C.SL_TICK_MIN, min(C.SL_TICK_MAX, sl_ticks))
+
+        # Intraday DD check — may halt entirely
+        dd_mult = self.check_intraday_dd()
+        if dd_mult <= 0:
+            return 0
 
         # Scale risk by session quality (NY Open=1.0, Lunch=0.5, etc.)
         streak_mult = 1.0
@@ -118,7 +189,16 @@ class RiskManager:
 
         # Recovery mode: halve risk when MLL buffer is dangerously low
         recovery_mult = 0.5 if self.state.mll_buffer < 500.0 else 1.0
-        risk_dollars = self.state.equity * C.RISK_PCT * session_weight * streak_mult * recovery_mult
+
+        # Regime-adaptive multiplier
+        regime_mult = self.regime_multiplier(atr_ratio, trend_aligned)
+
+        # Consecutive loss day scaling
+        consec_mult = self.state.consec_loss_risk_mult
+
+        risk_dollars = (self.state.equity * C.RISK_PCT
+                        * session_weight * streak_mult * recovery_mult
+                        * regime_mult * consec_mult * dd_mult * tod_weight)
         raw_qty = int(risk_dollars / (sl_ticks * C.MGC_TICK_VALUE))
 
         cap = self.max_contracts()
@@ -145,9 +225,11 @@ class RiskManager:
         return hit
 
     def soft_loss_hit(self) -> bool:
-        hit = self.state.day_pnl <= -C.SOFT_LOSS
+        effective_soft = C.SOFT_LOSS * self.state.consec_loss_soft_mult
+        hit = self.state.day_pnl <= -effective_soft
         if hit:
-            log.info("SOFT LOSS: day_pnl=$%.2f <= -$%.2f", self.state.day_pnl, C.SOFT_LOSS)
+            log.info("SOFT LOSS: day_pnl=$%.2f <= -$%.2f (consec_loss_days=%d)",
+                     self.state.day_pnl, effective_soft, self.state.consec_loss_days)
         return hit
 
     def max_trades_hit(self) -> bool:
@@ -163,6 +245,8 @@ class RiskManager:
         if self.soft_loss_hit():
             return False
         if self.max_trades_hit():
+            return False
+        if self.state.intraday_dd_halted:
             return False
         return True
 
@@ -214,20 +298,36 @@ class RiskManager:
             )
             return
 
+        # Track consecutive losing days
+        if today_pnl < -10.0:
+            s.consec_loss_days += 1
+            log.info("Consecutive losing days: %d", s.consec_loss_days)
+        elif today_pnl > 10.0:
+            if s.consec_loss_days > 0:
+                log.info("Loss streak broken after %d days", s.consec_loss_days)
+            s.consec_loss_days = 0
+
         # Reset daily counters
         s.day_pnl = 0.0
         s.day_trades = 0
+        s.intraday_peak = s.equity
+        s.intraday_dd_halted = False
 
         log.info(
             "EOD: equity=$%.2f, MLL=$%.2f, buffer=$%.2f, total_profit=$%.2f, "
-            "best_day=$%.2f, days=%d, required=$%.2f",
+            "best_day=$%.2f, days=%d, required=$%.2f, consec_loss=%d",
             s.equity, s.current_mll, s.mll_buffer, s.total_profit,
             s.best_single_day, s.trading_days, s.required_total,
+            s.consec_loss_days,
         )
 
     def update_equity_realtime(self, pnl_change: float) -> None:
         self.state.equity += pnl_change
         self.state.day_pnl += pnl_change
+
+        # Update intraday peak for DD monitoring
+        if self.state.equity > self.state.intraday_peak:
+            self.state.intraday_peak = self.state.equity
 
         # Intraday MLL breach check
         if self.state.equity < self.state.current_mll:

@@ -28,19 +28,28 @@ from lucidflex.strategy import StrategyProfile, PROFILES
 
 
 # ── Parameter search space ─────────────────────────────────────────────────
-# Realistic-mode friction punishes high-frequency / small-R setups hardest.
-# Search space biases toward higher RR, tighter confluence, fewer trades.
+# Quant-adversarial mode punishes:
+#   - High frequency / low edge-per-trade
+#   - High RR targets (unachievable live)
+#   - Low confluence (stop-hunts eat marginal setups)
+#   - Large position size (tail events blow small buffers)
+# Search space explores realistic RR (2.0-3.5) with partial profit taking
+# and very strict confluence.
 
 SEARCH_SPACE = {
-    "risk_pct":            [0.006, 0.008, 0.010, 0.012],
-    "min_rr":              [4.0, 4.5, 5.0, 5.5, 6.0],
-    "daily_cap":           [400.0, 500.0, 600.0, 700.0],
-    "soft_loss":           [300.0, 400.0, 500.0],
-    "max_trades_per_day":  [6, 8, 10, 12],
-    "min_confluence_score":[40, 45, 50, 55],
-    "breakeven_r":         [1.0, 1.2, 1.5],
-    "trail_start_r":       [2.0, 2.5, 3.0],
-    "atr_min_ticks":       [4, 5, 6],
+    "risk_pct":             [0.004, 0.005, 0.006, 0.008],
+    "min_rr":               [2.0, 2.5, 3.0, 3.5],
+    "daily_cap":            [400.0, 500.0, 600.0],
+    "soft_loss":            [300.0, 400.0, 500.0],
+    "max_trades_per_day":   [4, 6, 8, 10],
+    "min_confluence_score": [50, 55, 60, 65],
+    "breakeven_r":          [0.8, 1.0, 1.2],
+    "trail_start_r":        [1.5, 2.0, 2.5],
+    "atr_min_ticks":        [5, 6, 7],
+    "partial_tp_1_r":       [0.8, 1.0, 1.2],
+    "partial_tp_1_pct":     [0.40, 0.50, 0.60],
+    "partial_tp_2_r":       [1.5, 2.0, 2.5],
+    "partial_tp_2_pct":     [0.20, 0.30],
 }
 
 
@@ -109,10 +118,16 @@ def random_search(
     workers: int = 4,
     top_n: int = 10,
     realistic: bool = True,
+    adversarial: bool = False,
 ) -> List[Tuple[float, Dict, Dict]]:
     """Random search over parameter space — faster than grid for exploration."""
     rng = random.Random(base_seed)
-    mode = "REALISTIC" if realistic else "PAPER"
+    if adversarial:
+        mode = "QUANT-ADVERSARIAL"
+    elif realistic:
+        mode = "REALISTIC"
+    else:
+        mode = "PAPER"
     print(f"Random search [{mode}]: {trials} trials x {n_runs} runs each\n")
 
     results: List[Tuple[float, Dict, Dict]] = []
@@ -121,6 +136,7 @@ def random_search(
     for i in range(trials):
         params = {k: rng.choice(v) for k, v in SEARCH_SPACE.items()}
         params["realistic"] = realistic
+        params["quant_adversarial"] = adversarial
         label = f"trial-{i}"
 
         m = run_backtest(n_runs=n_runs, base_seed=base_seed, workers=workers,
@@ -170,16 +186,20 @@ def main():
     parser.add_argument("--top", type=int, default=10, help="Top N results to show")
     parser.add_argument("--paper", action="store_true",
                         help="Run in paper (idealized) mode instead of realistic mode")
+    parser.add_argument("--adversarial", action="store_true",
+                        help="Run in QUANT-ADVERSARIAL mode (realistic + black swans + correlated losses)")
     args = parser.parse_args()
 
     realistic = not args.paper
+    adversarial = args.adversarial
 
     if args.mode == "grid":
         grid_search(n_runs=args.runs, base_seed=args.seed, workers=args.workers,
                     top_n=args.top, realistic=realistic)
     else:
         random_search(trials=args.trials, n_runs=args.runs, base_seed=args.seed,
-                      workers=args.workers, top_n=args.top, realistic=realistic)
+                      workers=args.workers, top_n=args.top, realistic=realistic,
+                      adversarial=adversarial)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ class Indicators:
         "_rsi_losses", "_vol_sum", "_vol_count",
         "_ema_1h_fast", "_ema_1h_slow",
         "_atr", "_atr_avg", "_atr_values",
+        "_bid", "_ask",
     )
 
     def __init__(self) -> None:
@@ -66,6 +67,9 @@ class Indicators:
         self._atr: float = 0.0
         self._atr_avg: float = 0.0
         self._atr_values: Deque[float] = deque(maxlen=C.VOLUME_AVG_PERIOD)
+        # Spread tracking for liquidity filter
+        self._bid: float = 0.0
+        self._ask: float = 0.0
 
     # ── Public accessors ────────────────────────────────────────────────
 
@@ -132,6 +136,42 @@ class Indicators:
     def atr_too_low(self) -> bool:
         """True when ATR < minimum threshold (dead/choppy market)."""
         return self.atr_ticks < C.ATR_MIN_TICKS
+
+    @property
+    def atr_ratio(self) -> float:
+        """Current ATR / ATR average. >1 means above-average vol."""
+        if self._atr_avg <= 0:
+            return 1.0
+        return self._atr / self._atr_avg
+
+    @property
+    def spread_ticks(self) -> float:
+        """Current bid-ask spread in ticks."""
+        if self._bid <= 0 or self._ask <= 0:
+            return 0.0
+        return (self._ask - self._bid) / C.TICK_SIZE
+
+    @property
+    def spread_too_wide(self) -> bool:
+        """True when spread exceeds max threshold — reject trades."""
+        if not C.SPREAD_FILTER_ENABLED:
+            return False
+        return self.spread_ticks > C.SPREAD_MAX_TICKS
+
+    def update_quote(self, bid: float, ask: float) -> None:
+        """Update bid/ask for spread monitoring."""
+        if bid > 0:
+            self._bid = bid
+        if ask > 0:
+            self._ask = ask
+
+    @property
+    def trend_aligned(self) -> bool:
+        """True when both 5m and 1H EMAs agree on direction."""
+        if not self._bars_5m or not self._bars_1h:
+            return False
+        return (self.ema_bullish() and self.ema_1h_bullish()) or \
+               (self.ema_bearish() and self.ema_1h_bearish())
 
     # ── VWAP reset (daily at 6 PM EST / CME open) ──────────────────────
 
@@ -428,6 +468,12 @@ class RithmicDataFeed:
 
             self._last_tick_price = price
             self._last_tick_time = ts
+
+            # Update bid/ask spread tracking
+            bid = getattr(tick, 'bid_price', 0.0)
+            ask = getattr(tick, 'ask_price', 0.0)
+            if bid > 0 and ask > 0:
+                self.indicators.update_quote(bid, ask)
 
             self._aggregate_5m(price, volume, ts)
             self._aggregate_1h(price, volume, ts)

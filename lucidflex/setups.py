@@ -504,6 +504,11 @@ def scan_all(
     if ind.atr_too_low:
         return None
 
+    # Spread filter: skip if bid-ask is too wide (poor liquidity)
+    if ind.spread_too_wide:
+        log.debug("Spread too wide (%.1f ticks) — skipping scan", ind.spread_ticks)
+        return None
+
     session = tracker.current_session(now)
     candidates: List[TradeSignal] = []
 

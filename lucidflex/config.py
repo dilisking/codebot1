@@ -143,6 +143,115 @@ ATR_ADAPTIVE_TP_MAX_RR = 6.0    # Cap adaptive TP at 6R
 WIN_STREAK_BOOST_AFTER = 2      # Boost sizing after 2 consecutive wins
 WIN_STREAK_BOOST_MULT = 1.2     # 1.2x position size on streak (capped by Layer 3)
 
+# ── Quant-grade partial profit taking ─────────────────────────────────────
+# Scale out of positions to lock in edge and reduce variance.
+# Default behavior: take 50% at 1R (free trade), 30% at 2R (bank profit),
+# let 20% runner go to 3R+ with tight trail.
+PARTIAL_TP_1_R = 1.0            # first partial at 1R
+PARTIAL_TP_1_PCT = 0.50         # close 50% at 1R
+PARTIAL_TP_2_R = 2.0            # second partial at 2R
+PARTIAL_TP_2_PCT = 0.30         # close 30% at 2R
+RUNNER_TRAIL_R = 0.8            # tight trail on the 20% runner
+
+# ── Quant-grade Kelly sizing ─────────────────────────────────────────────
+# Half-Kelly on rolling window of last N trades. Caps at 1.5x base risk,
+# floors at 0.2x. Requires MIN trades before activation.
+KELLY_ENABLED = True
+KELLY_LOOKBACK_TRADES = 20      # window for rolling WR/RR estimate
+KELLY_MIN_TRADES = 10           # need at least this many to activate
+KELLY_FRACTION = 0.5            # half-Kelly for safety
+KELLY_MAX_MULT = 1.5            # cap on Kelly boost
+KELLY_MIN_MULT = 0.2            # floor so we never stop completely
+
+# ── Setup auto-disable tracker ───────────────────────────────────────────
+# Disable any setup whose rolling win rate drops below threshold.
+SETUP_TRACKER_ENABLED = True
+SETUP_TRACKER_WINDOW = 50       # rolling trade count per setup
+SETUP_TRACKER_MIN_SAMPLES = 20  # need at least this many before judging
+SETUP_TRACKER_MIN_WR = 0.42     # disable if rolling WR below this
+
+# ── News blackout (replaces news boost) ──────────────────────────────────
+# No more position boosting on news. Flatten before, wait after.
+NEWS_BLACKOUT_PRE_SEC = 300     # 5 min before high-impact event
+NEWS_BLACKOUT_POST_SEC = 600    # 10 min after
+NEWS_FLATTEN_PRE_SEC = 180      # flatten all positions 3 min before news
+
+# ── Model drift monitoring ───────────────────────────────────────────────
+DRIFT_MONITOR_WINDOW = 20       # rolling trades to compare live vs expected
+DRIFT_PAUSE_Z = -2.0            # pause bot if z-score below this
+
+# ── Regime-adaptive position sizing ──────────────────────────────────
+# Scale risk down when volatility or regime signals danger, scale up when
+# conditions favor trend-following. Applied as a multiplier on base risk_pct.
+REGIME_ADAPT_ENABLED = True
+REGIME_VOL_HIGH_THRESH = 1.8    # ATR ratio above which we cut risk
+REGIME_VOL_HIGH_MULT = 0.60     # 60% of base risk in high-vol
+REGIME_VOL_LOW_THRESH = 0.5     # ATR ratio below which market is dead
+REGIME_VOL_LOW_MULT = 0.40      # 40% risk in dead market (barely trade)
+REGIME_TREND_BONUS = 1.15       # 15% boost when 5m + 1h EMAs agree
+
+# ── Correlation-aware daily loss scaling ─────────────────────────────
+# After consecutive losing days, progressively tighten daily limits to
+# prevent account bleed. Resets after a green day.
+CONSEC_LOSS_SCALE_ENABLED = True
+CONSEC_LOSS_1_SOFT_MULT = 0.75  # after 1 losing day: 75% of soft_loss
+CONSEC_LOSS_2_SOFT_MULT = 0.50  # after 2 losing days: 50% of soft_loss
+CONSEC_LOSS_3_SOFT_MULT = 0.35  # after 3+: 35% (survival mode)
+CONSEC_LOSS_1_RISK_MULT = 0.80  # risk sizing reduction after 1 loss day
+CONSEC_LOSS_2_RISK_MULT = 0.60  # after 2
+CONSEC_LOSS_3_RISK_MULT = 0.40  # after 3+ (barely trading, waiting for edge)
+
+# ── Intraday equity curve monitoring ─────────────────────────────────
+# If intraday drawdown from session peak exceeds threshold, throttle or halt.
+INTRADAY_DD_THROTTLE_PCT = 0.006  # 0.6% of equity → throttle (half risk)
+INTRADAY_DD_HALT_PCT = 0.010      # 1.0% of equity → stop trading for the day
+INTRADAY_DD_ENABLED = True
+
+# ── Spread / liquidity filter ────────────────────────────────────────
+# Reject trades when the bid-ask spread exceeds threshold (ticks).
+# Wide spreads eat into edge and cause adverse fills.
+SPREAD_MAX_TICKS = 4            # reject if spread > 4 ticks ($0.40 on MGC)
+SPREAD_FILTER_ENABLED = True
+
+# ── Max Adverse Excursion (MAE) early exit ───────────────────────────
+# If a trade immediately moves against by > MAE_EXIT_R within MAE_WINDOW_SEC,
+# cut early instead of waiting for the full SL. Limits damage from
+# stop-hunt / false breakout traps.
+MAE_EXIT_ENABLED = True
+MAE_EXIT_R = -0.6               # if trade hits -0.6R within first 60s
+MAE_WINDOW_SEC = 60             # only applies in the first 60 seconds
+MAE_MIN_HOLD_SEC = 8            # respect scalp rule: minimum hold before MAE exit
+
+# ── Time-of-day edge weighting ───────────────────────────────────────
+# Empirical edge varies by hour. Suppress signals during historically
+# low-edge hours and boost during proven windows.
+TOD_WEIGHT_ENABLED = True
+TOD_WEIGHTS = {
+    3: 0.70,   # London open — decent but noisy
+    4: 0.75,
+    5: 0.65,   # London/NY gap — thin liquidity
+    6: 0.50,   # Pre-pre-market — dead zone
+    7: 0.80,   # NY pre-market ramp
+    8: 1.00,   # NY open — peak edge
+    9: 1.00,   # NY open continued
+    10: 0.95,  # NY mid-morning
+    11: 0.60,  # Lunch starts — edge collapses
+    12: 0.45,  # Lunch dead zone
+    13: 0.70,  # Afternoon recovery
+    14: 0.80,  # Afternoon continuation
+    15: 0.65,  # Late afternoon — thinning
+}
+
+# ── Day-of-week effects ──────────────────────────────────────────────
+DOW_WEIGHT_ENABLED = True
+DOW_WEIGHTS = {
+    0: 0.85,  # Monday — gap risk, uncertain direction
+    1: 1.00,  # Tuesday — best trend day historically
+    2: 1.00,  # Wednesday — FOMC days volatile but tradeable
+    3: 0.95,  # Thursday — claims day, moderate
+    4: 0.70,  # Friday — thin after lunch, weekend risk
+}
+
 # ── Rithmic connection defaults ─────────────────────────────────────────────
 RITHMIC_ENV = "PAPER"
 RITHMIC_GATEWAY = "paper.rithmic.com"

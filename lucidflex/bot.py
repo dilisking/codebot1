@@ -31,6 +31,7 @@ from lucidflex.market_data import Indicators, RithmicDataFeed, SessionTracker
 from lucidflex.risk import EvalState, RiskManager
 from lucidflex.execution import ExecutionEngine
 from lucidflex.setups import scan_all
+from lucidflex.quant_edge import KellySizer, SetupTracker, DriftMonitor, NewsBlackout
 
 log = logging.getLogger("lucidflex")
 
@@ -57,23 +58,41 @@ class TradingBot:
         self.session_tracker = SessionTracker()
         self.data_feed = RithmicDataFeed(self.indicators, self.session_tracker)
         self.execution = ExecutionEngine(self.risk_mgr)
+        # Quant-grade edge modules
+        self.kelly = KellySizer()
+        self.setup_tracker = SetupTracker()
+        self.drift_monitor = DriftMonitor()
         # Pre-sort news events for fast lookup via pointer
         self._news_events: list = []
         self._next_news_idx: int = 0
+        parsed_events = []
         if news_events:
-            parsed = []
             for event_str in news_events:
                 try:
-                    parsed.append(datetime.fromisoformat(event_str))
+                    parsed_events.append(datetime.fromisoformat(event_str))
                 except ValueError:
                     log.warning("Invalid news event time: %s", event_str)
-            self._news_events = sorted(parsed)
+            self._news_events = sorted(parsed_events)
+        self.news_blackout = NewsBlackout(parsed_events if parsed_events else None)
         self._running = False
         self._fill_monitor_task: Optional[asyncio.Task] = None
         self._data_task: Optional[asyncio.Task] = None
         self._last_vwap_reset_date: Optional[datetime] = None
 
     # ── State persistence (atomic write) ────────────────────────────────
+
+    def _record_closed_trades(self) -> None:
+        """Feed closed trades to quant edge modules for live adaptation."""
+        for trade in self.execution.closed_trades:
+            if not hasattr(trade, '_recorded'):
+                r_mult = trade.unrealized_r(trade.close_price) if trade.close_price > 0 else 0
+                if trade.pnl != 0:
+                    risk_dist = trade.risk_distance
+                    if risk_dist > 0:
+                        r_mult = trade.pnl / (risk_dist * trade.quantity * C.MGC_TICK_VALUE)
+                    self.kelly.record_trade(r_mult)
+                    self.setup_tracker.record(trade.signal.setup.value, trade.pnl > 0)
+                trade._recorded = True
 
     def save_state(self) -> None:
         data = {
@@ -86,6 +105,7 @@ class TradingBot:
             "trading_days": self.state.trading_days,
             "challenge_passed": self.state.challenge_passed,
             "challenge_failed": self.state.challenge_failed,
+            "consec_loss_days": self.state.consec_loss_days,
         }
         # Atomic write: write to temp file then rename
         try:
@@ -118,6 +138,7 @@ class TradingBot:
             self.state.trading_days = data["trading_days"]
             self.state.challenge_passed = data.get("challenge_passed", False)
             self.state.challenge_failed = data.get("challenge_failed", False)
+            self.state.consec_loss_days = data.get("consec_loss_days", 0)
             log.info(
                 "State loaded: equity=$%.2f, MLL=$%.2f, profit=$%.2f, days=%d",
                 self.state.equity, self.state.current_mll,
@@ -187,6 +208,20 @@ class TradingBot:
 
     async def _eod_settle(self) -> None:
         log.info("=== 4:45 PM EST — EOD SETTLEMENT ===")
+
+        # Record any remaining closed trades
+        self._record_closed_trades()
+
+        # Log quant edge module stats
+        kelly_stats = self.kelly.stats()
+        log.info("Kelly: n=%d wr=%.1f%% avg_r=%.2f mult=%.2f",
+                 kelly_stats["n"], kelly_stats["wr"],
+                 kelly_stats["avg_r"], kelly_stats["mult"])
+        setup_report = self.setup_tracker.report()
+        for name, info in setup_report.items():
+            log.info("Setup %s: n=%d wr=%.1f%% enabled=%s",
+                     name, info["n"], info["wr"], info["enabled"])
+
         closing_equity = self.state.equity
         self.risk_mgr.settle_eod(closing_equity)
         self.save_state()
@@ -250,10 +285,30 @@ class TradingBot:
                 if self.execution.has_position:
                     await self.execution.manage_positions(current_price, t, session)
 
+                # Record any newly closed trades for quant edge modules
+                self._record_closed_trades()
+
+                # News blackout: flatten before high-impact events
+                if self.news_blackout.should_flatten(now):
+                    if self.execution.has_position:
+                        log.warning("NEWS BLACKOUT FLATTEN: flattening before event")
+                        await self.execution.flatten_all(current_price, reason="NEWS_BLACKOUT")
+
+                # Drift monitor: pause if live results diverge from expectation
+                if self.drift_monitor.paused:
+                    log.warning("DRIFT MONITOR PAUSED — skipping trading")
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+
                 # Skip new trades if outside hours, risk limits hit, or in cooldown
                 if (not self._should_trade() or
                         not self.risk_mgr.can_trade() or
                         self.execution.in_cooldown):
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    continue
+
+                # News blackout: no new trades during blackout window
+                if self.news_blackout.is_blackout(now):
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
@@ -267,12 +322,44 @@ class TradingBot:
                     )
 
                     if signal:
-                        # Pass session weight for position sizing
+                        # Setup tracker: skip disabled setups
+                        if not self.setup_tracker.is_enabled(signal.setup.value):
+                            log.info("Setup %s disabled by tracker — skipping",
+                                     signal.setup.value)
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        # Compute adaptive multipliers
                         sw = session.size_weight if session else 0.7
-                        log.info("Signal: %s %s (score=%d, session=%s)",
-                                 signal.setup.value, signal.direction.name,
-                                 signal.confluence, session.name if session else "none")
-                        await self.execution.execute_signal(signal, session_weight=sw)
+                        atr_ratio = self.indicators.atr_ratio
+                        trend_ok = self.indicators.trend_aligned
+
+                        # Time-of-day edge weighting
+                        tod_weight = 1.0
+                        if C.TOD_WEIGHT_ENABLED:
+                            tod_weight = C.TOD_WEIGHTS.get(t.hour, 0.7)
+
+                        # Day-of-week weighting
+                        if C.DOW_WEIGHT_ENABLED:
+                            dow = now.weekday()
+                            tod_weight *= C.DOW_WEIGHTS.get(dow, 0.85)
+
+                        # Kelly multiplier on session weight
+                        kelly_mult = self.kelly.current_multiplier()
+                        sw *= kelly_mult
+
+                        log.info(
+                            "Signal: %s %s (score=%d, session=%s, kelly=%.2f, "
+                            "atr_ratio=%.2f, tod=%.2f)",
+                            signal.setup.value, signal.direction.name,
+                            signal.confluence, session.name if session else "none",
+                            kelly_mult, atr_ratio, tod_weight,
+                        )
+                        await self.execution.execute_signal(
+                            signal, session_weight=sw,
+                            atr_ratio=atr_ratio, trend_aligned=trend_ok,
+                            tod_weight=tod_weight,
+                        )
 
                 await asyncio.sleep(SCAN_INTERVAL)
 

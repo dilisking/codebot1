@@ -56,6 +56,10 @@ class Trade:
     breakeven_moved: bool = False  # whether SL has been moved to entry
     trailing_active: bool = False  # whether trailing stop is engaged
     earliest_close: float = 0.0   # monotonic time: earliest allowed close (scalp rule)
+    # Partial profit tracking
+    partial_1_done: bool = False   # first partial taken at PARTIAL_TP_1_R
+    partial_2_done: bool = False   # second partial taken at PARTIAL_TP_2_R
+    remaining_qty: int = 0         # contracts still open after partials
 
     @property
     def hold_seconds(self) -> float:
@@ -153,12 +157,18 @@ class ExecutionEngine:
         self,
         signal: TradeSignal,
         session_weight: float = 1.0,
+        atr_ratio: float = 1.0,
+        trend_aligned: bool = False,
+        tod_weight: float = 1.0,
     ) -> Optional[Trade]:
         qty = self.risk_mgr.size_position(
             signal.sl_ticks,
             is_news=signal.is_news,
             session_weight=session_weight,
             win_streak=self._win_streak,
+            atr_ratio=atr_ratio,
+            trend_aligned=trend_aligned,
+            tod_weight=tod_weight,
         )
         if qty <= 0:
             log.warning("Position sizing returned 0 — skipping trade")
@@ -176,6 +186,7 @@ class ExecutionEngine:
             trade.earliest_close = trade.fill_time + signal.min_hold_sec
             trade.current_sl = signal.sl
             trade.status = TradeStatus.FILLED
+            trade.remaining_qty = qty
             self._position += qty if side == OrderSide.BUY else -qty
 
             # Submit bracket SL/TP orders
@@ -223,6 +234,22 @@ class ExecutionEngine:
             ur = trade.unrealized_r(current_price)
             hold_min = trade.hold_seconds / 60.0
 
+            # 0) Partial profit taking at configured R-levels
+            if not trade.partial_1_done and ur >= C.PARTIAL_TP_1_R and trade.remaining_qty > 1:
+                close_qty = max(1, int(trade.quantity * C.PARTIAL_TP_1_PCT))
+                close_qty = min(close_qty, trade.remaining_qty - 1)  # keep at least 1
+                if close_qty > 0 and trade.held_long_enough:
+                    await self._partial_close(trade, current_price, close_qty, "PARTIAL_1")
+                    trade.partial_1_done = True
+
+            if (not trade.partial_2_done and trade.partial_1_done
+                    and ur >= C.PARTIAL_TP_2_R and trade.remaining_qty > 1):
+                close_qty = max(1, int(trade.quantity * C.PARTIAL_TP_2_PCT))
+                close_qty = min(close_qty, trade.remaining_qty - 1)
+                if close_qty > 0 and trade.held_long_enough:
+                    await self._partial_close(trade, current_price, close_qty, "PARTIAL_2")
+                    trade.partial_2_done = True
+
             # 1) Breakeven move at 1.5R
             if not trade.breakeven_moved and ur >= C.BREAKEVEN_R:
                 new_sl = trade.fill_price
@@ -250,13 +277,21 @@ class ExecutionEngine:
                     log.info("TRAIL: %s SL → %.2f (%.1fR profit)",
                              trade.signal.setup.value, new_sl, ur)
 
-            # 3) Stale trade exit: >20 min with <0.5R
+            # 3) MAE early exit: if trade immediately moves against hard
+            if C.MAE_EXIT_ENABLED:
+                hold_sec = trade.hold_seconds
+                if (hold_sec <= C.MAE_WINDOW_SEC and hold_sec >= C.MAE_MIN_HOLD_SEC
+                        and ur <= C.MAE_EXIT_R):
+                    await self.close_trade(trade, current_price, reason="MAE_EXIT")
+                    continue
+
+            # 4) Stale trade exit: >20 min with <0.5R
             if hold_min >= C.STALE_TRADE_MINUTES and ur < C.STALE_TRADE_MIN_R:
                 if trade.held_long_enough:
                     await self.close_trade(trade, current_price, reason="STALE")
                     continue
 
-            # 4) Session-end exit: close 5 min before session ends
+            # 5) Session-end exit: close 5 min before session ends
             if current_session:
                 session_end_h = current_session.end.hour
                 session_end_m = current_session.end.minute
@@ -267,6 +302,46 @@ class ExecutionEngine:
                     if trade.held_long_enough:
                         await self.close_trade(trade, current_price, reason="SESSION_END")
                         continue
+
+    async def _partial_close(self, trade: Trade, price: float, qty: int, reason: str) -> None:
+        """Close a partial quantity of an open trade, locking in profit."""
+        close_side = OrderSide.SELL if trade.side == OrderSide.BUY else OrderSide.BUY
+        try:
+            resp = await self._submit_market_order(close_side, qty)
+            fill_price = resp.get("fill_price", price)
+
+            # Calculate partial PnL
+            if trade.side == OrderSide.BUY:
+                tick_diff = (fill_price - trade.fill_price) / C.TICK_SIZE
+            else:
+                tick_diff = (trade.fill_price - fill_price) / C.TICK_SIZE
+            partial_pnl = tick_diff * qty * C.MGC_TICK_VALUE
+
+            trade.pnl += partial_pnl
+            trade.remaining_qty -= qty
+            if trade.side == OrderSide.BUY:
+                self._position -= qty
+            else:
+                self._position += qty
+
+            self.risk_mgr.update_equity_realtime(partial_pnl)
+
+            # Update SL/TP orders to reflect reduced quantity
+            await self._cancel_order(trade.sl_order_id)
+            await self._cancel_order(trade.tp_order_id)
+            sl_side = OrderSide.SELL if trade.side == OrderSide.BUY else OrderSide.BUY
+            sl_resp = await self._submit_stop_order(sl_side, trade.remaining_qty, trade.current_sl)
+            trade.sl_order_id = sl_resp.get("order_id", "")
+            tp_resp = await self._submit_limit_order(sl_side, trade.remaining_qty, trade.signal.tp)
+            trade.tp_order_id = tp_resp.get("order_id", "")
+
+            log.info(
+                "PARTIAL [%s]: %s closed %d/%d MGC @ %.2f PnL=$%.2f remaining=%d",
+                reason, trade.signal.setup.value, qty, trade.quantity,
+                fill_price, partial_pnl, trade.remaining_qty,
+            )
+        except Exception:
+            log.exception("Failed partial close for %s", trade.order_id)
 
     async def _modify_stop(self, trade: Trade, new_price: float) -> None:
         """Cancel existing SL and place a new one at the updated price."""
