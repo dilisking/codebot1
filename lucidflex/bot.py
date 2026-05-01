@@ -473,11 +473,13 @@ def main() -> None:
     parser.add_argument("--password", required=True, help="Rithmic password")
     parser.add_argument("--system", required=True, help="Rithmic system name")
     parser.add_argument("--gateway", default=C.RITHMIC_GATEWAY, help="Rithmic gateway")
+    parser.add_argument("--env", default=C.RITHMIC_ENV, choices=["PAPER", "LIVE"],
+                        help="Rithmic environment: PAPER (default) or LIVE")
     parser.add_argument("--news", nargs="*", default=[], help="News event times (ISO format)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--reset", action="store_true", help="Reset evaluation state")
     parser.add_argument("--strategy", type=str, default=None,
-                        help="Strategy profile (default, high_volume, conservative, aggressive)")
+                        help="Strategy profile: default, conservative, realistic, survivor, adaptive")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -498,12 +500,29 @@ def main() -> None:
         STATE_FILE.unlink()
         log.info("State reset")
 
+    # Apply environment override (PAPER vs LIVE)
+    C.RITHMIC_ENV = args.env
+    if args.env == "LIVE":
+        log.warning("=" * 60)
+        log.warning("LIVE TRADING MODE — REAL MONEY AT RISK")
+        log.warning("Verify strategy profile and credentials before continuing")
+        log.warning("=" * 60)
+
     credentials = {
         "user": args.user,
         "password": args.password,
         "system_name": args.system,
         "gateway": args.gateway,
     }
+
+    # Validate news event format if provided
+    if args.news:
+        for ev in args.news:
+            try:
+                datetime.fromisoformat(ev)
+            except ValueError:
+                log.error("Invalid news event ISO timestamp: %s", ev)
+                sys.exit(1)
 
     bot = TradingBot(credentials, news_events=args.news)
 

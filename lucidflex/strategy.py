@@ -80,34 +80,6 @@ DEFAULT = StrategyProfile(
     post_loss_cooldown_sec=10.0,
 )
 
-# ── Strategy: High Volume ──────────────────────────────────────────────────
-
-HIGH_VOLUME = StrategyProfile(
-    name="high_volume",
-    description="High-frequency approach — 2.5R RR, more trades, tighter management",
-    risk_pct=0.012,
-    min_rr=2.5,
-    daily_cap=500.0,         # Tighter cap for consistency with more trades
-    soft_loss=500.0,
-    max_trades_per_day=20,   # Many more trade opportunities
-    breakeven_r=1.0,         # Aggressive BE move
-    trail_start_r=1.8,       # Trail sooner
-    trail_distance_r=1.0,    # Tighter trail
-    stale_trade_minutes=12,  # Exit stale trades faster
-    stale_trade_min_r=0.3,
-    session_end_min_r=1.5,
-    min_confluence_score=30,  # Lower bar = more trades
-    atr_min_ticks=3,          # Trade in thinner conditions
-    atr_adaptive_tp_mult=1.2,
-    atr_adaptive_tp_max_rr=4.0,
-    win_streak_boost_after=3,  # Require longer streak
-    win_streak_boost_mult=1.15,
-    news_boost=1.3,
-    post_loss_cooldown_sec=5.0,  # Faster recovery
-    sl_tick_min=4,
-    sl_tick_max=30,          # Tighter max SL
-)
-
 # ── Strategy: Conservative ──────────────────────────────────────────────────
 
 CONSERVATIVE = StrategyProfile(
@@ -132,60 +104,6 @@ CONSERVATIVE = StrategyProfile(
     news_boost=1.2,
     post_loss_cooldown_sec=15.0,
 )
-
-# ── Strategy: Aggressive ──────────────────────────────────────────────────
-
-AGGRESSIVE = StrategyProfile(
-    name="aggressive",
-    description="Fast pass — 3.5R RR, higher risk, targets quick profit accumulation",
-    risk_pct=0.015,
-    min_rr=3.5,
-    daily_cap=700.0,
-    soft_loss=600.0,
-    max_trades_per_day=15,
-    breakeven_r=1.2,
-    trail_start_r=2.0,
-    trail_distance_r=1.2,
-    stale_trade_minutes=15,
-    stale_trade_min_r=0.4,
-    min_confluence_score=35,
-    atr_min_ticks=3,
-    atr_adaptive_tp_mult=1.2,
-    atr_adaptive_tp_max_rr=5.0,
-    win_streak_boost_after=2,
-    win_streak_boost_mult=1.25,
-    news_boost=1.8,
-    post_loss_cooldown_sec=8.0,
-    sl_tick_min=5,
-    sl_tick_max=35,
-)
-
-
-# ── Strategy: Optimizer Best (found by autonomous random search) ───────────
-
-OPTIMIZER_BEST = StrategyProfile(
-    name="optimizer_best",
-    description="Best config from 20-trial optimizer — 99.1% pass, Sharpe 10.86",
-    risk_pct=0.008,
-    min_rr=4.5,
-    daily_cap=600.0,
-    soft_loss=500.0,
-    max_trades_per_day=20,
-    breakeven_r=1.5,
-    trail_start_r=2.5,
-    trail_distance_r=1.5,
-    stale_trade_minutes=20,
-    stale_trade_min_r=0.5,
-    min_confluence_score=30,
-    atr_min_ticks=4,
-    atr_adaptive_tp_mult=1.3,
-    atr_adaptive_tp_max_rr=6.0,
-    win_streak_boost_after=2,
-    win_streak_boost_mult=1.2,
-    news_boost=1.5,
-    post_loss_cooldown_sec=10.0,
-)
-
 
 # ── Strategy: Realistic (optimized against realistic friction model) ──────
 # Found by 80-trial random search under realistic-mode conditions:
@@ -297,10 +215,7 @@ ADAPTIVE = StrategyProfile(
 
 PROFILES: Dict[str, StrategyProfile] = {
     "default": DEFAULT,
-    "high_volume": HIGH_VOLUME,
     "conservative": CONSERVATIVE,
-    "aggressive": AGGRESSIVE,
-    "optimizer_best": OPTIMIZER_BEST,
     "realistic": REALISTIC,
     "survivor": SURVIVOR,
     "adaptive": ADAPTIVE,
